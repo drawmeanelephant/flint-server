@@ -153,14 +153,63 @@ pub const TimedReader = struct {
     }
 };
 
-pub fn parseListenAddress(addr_str: []const u8) !Io.net.IpAddress {
+pub fn parseListenAddress(io: Io, addr_str: []const u8) !Io.net.IpAddress {
     return Io.net.IpAddress.parseLiteral(addr_str) catch {
         const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return error.InvalidAddress;
         const host = addr_str[0..colon];
         const port_str = addr_str[colon + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
-        return Io.net.IpAddress.parse(host, port);
+        return resolveListenHost(io, host, port);
     };
+}
+
+/// Resolves `host` to a listen address, accepting literal IPs and resolving
+/// hostnames via the same `Io.net.HostName.lookup` path the client uses on
+/// dial — so `--listen=localhost:4748` works.
+fn resolveListenHost(io: Io, host: []const u8, port: u16) !Io.net.IpAddress {
+    if (Io.net.IpAddress.parse(host, port)) |literal| {
+        return literal;
+    } else |_| {}
+
+    const host_name = Io.net.HostName.init(host) catch return error.InvalidAddress;
+    var results_buffer: [16]Io.net.HostName.LookupResult = undefined;
+    var results: Io.Queue(Io.net.HostName.LookupResult) = .init(&results_buffer);
+    var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    try host_name.lookup(io, &results, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    });
+    // lookup closes the queue before returning; buffered results still drain.
+    // Prefer IPv4 so that e.g. localhost binds where 127.0.0.1 clients reach it.
+    var fallback: ?Io.net.IpAddress = null;
+    while (results.getOneUncancelable(io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip4 => return address,
+                .ip6 => if (fallback == null) {
+                    fallback = address;
+                },
+            },
+            .canonical_name => continue,
+        }
+    } else |_| {}
+    return fallback orelse error.UnknownHostName;
+}
+
+test "parseListenAddress accepts literals and resolves hostnames" {
+    const io = std.testing.io;
+
+    const v4 = try parseListenAddress(io, "127.0.0.1:4748");
+    try std.testing.expectEqual(@as(u16, 4748), v4.getPort());
+
+    const v6 = try parseListenAddress(io, "[::1]:4748");
+    try std.testing.expectEqual(@as(u16, 4748), v6.getPort());
+
+    const resolved = try parseListenAddress(io, "localhost:4748");
+    try std.testing.expectEqual(@as(u16, 4748), resolved.getPort());
+
+    try std.testing.expectError(error.InvalidPort, parseListenAddress(io, "localhost:notaport"));
+    try std.testing.expectError(error.InvalidAddress, parseListenAddress(io, "no-port-here"));
 }
 
 pub fn serveTcp(
@@ -171,7 +220,7 @@ pub fn serveTcp(
     max_conns: ?usize,
     read_timeout: Io.Timeout,
 ) !void {
-    const addr = try parseListenAddress(listen_str);
+    const addr = try parseListenAddress(io, listen_str);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 

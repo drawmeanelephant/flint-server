@@ -252,8 +252,14 @@ pub fn main(init: std.process.Init) !u8 {
                 .none
             else
                 .{ .duration = .{ .raw = Io.Duration.fromSeconds(read_timeout_sec), .clock = .awake } };
-            serve.serveTcp(io, allocator, cfg, bind_str, null, read_timeout) catch {
-                printRefusal(io, .usage, "failed to listen on address");
+            serve.serveTcp(io, allocator, cfg, bind_str, null, read_timeout) catch |err| {
+                var detail_buf: [128]u8 = undefined;
+                const detail = std.fmt.bufPrint(
+                    &detail_buf,
+                    "failed to listen on {s}: {s}",
+                    .{ bind_str, @errorName(err) },
+                ) catch "failed to listen on address";
+                printRefusal(io, .usage, detail);
                 return 1;
             };
         }
