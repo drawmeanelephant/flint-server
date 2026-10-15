@@ -109,7 +109,7 @@ Refusal:
 
 | `op` | Request fields | Response fields | Refusals |
 |---|---|---|---|
-| `hello` | `proto` | `proto:"FLINT-SYNC/1"`, `server:"flintd"` | `proto_version` on mismatch; `auth_required` when `--auth-key` is set and no `auth` has succeeded |
+| `hello` | `proto` | `proto:"FLINT-SYNC/1"`, `server:"flintd"`, `spec_rev:<int>` | `proto_version` on mismatch; `auth_required` when `--auth-key` is set and no `auth` has succeeded |
 | `auth` | `nonce`, `hmac` | `ok:true` | `auth_failed`; only present with `--auth-key` (§3.2) |
 | `list` | — | `streams:[<record>, …]` | — |
 | `heads` | — | `heads:{<id>:<head|null>, …}` | — |
@@ -120,6 +120,15 @@ Refusal:
 
 `stream`/`after` fields take canonical lowercase UUID strings; `open` also
 accepts a stream **name**.
+
+`hello` success replies announce `spec_rev`, the server's
+protocol-visible spec revision (repo-root `SPECREV`;
+`docs/spec-versioning.md`). It is the last field of the ok reply —
+after `nonce` when `--auth-key` is set — so an unauthenticated probe
+can read it before answering the challenge. The field is additive:
+clients must tolerate its absence or a non-integer value as
+unannounced, and `proto` remains the only compatibility gate —
+`spec_rev` is a drift signal, not negotiation.
 
 ### 2.3 `append` semantics — the ADR commit order, verbatim
 

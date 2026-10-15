@@ -400,10 +400,10 @@ test "M106d & M106f: golden transcript auth_refuse.ndjson and successful HMAC au
 
     const expected = try std.fmt.allocPrint(
         allocator,
-        "{{\"seq\":1,\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"nonce\":\"{s}\"}}\n" ++
+        "{{\"seq\":1,\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"nonce\":\"{s}\",\"spec_rev\":{d}}}\n" ++
             "{{\"seq\":2,\"ok\":true}}\n" ++
             "{{\"seq\":3,\"ok\":true,\"streams\":[]}}\n",
-        .{nonce_hex},
+        .{ nonce_hex, proto.SpecRev },
     );
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, out_w.written());

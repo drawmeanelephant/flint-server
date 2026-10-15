@@ -9,6 +9,11 @@ const logging = @import("logging.zig");
 const RefusalCode = store.RefusalCode;
 const Stream = store.Stream;
 
+/// Protocol-visible spec revision, kept in lockstep with the repo-root
+/// SPECREV file by tools/tests/test_specrev.py (docs/spec-versioning.md).
+/// Announced in `hello` ok replies.
+pub const SpecRev: u32 = 1;
+
 pub const Session = struct {
     root_path: []const u8,
     auth_key: ?[32]u8 = null,
@@ -183,14 +188,14 @@ fn handleHello(
         }
         const nonce_hex = store.encodeLowerHexFixed(16, session.nonce);
         try w.print(
-            "{{\"seq\":{d},\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"nonce\":\"{s}\"}}\n",
-            .{ seq, nonce_hex },
+            "{{\"seq\":{d},\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"nonce\":\"{s}\",\"spec_rev\":{d}}}\n",
+            .{ seq, nonce_hex, SpecRev },
         );
     } else {
         session.authed = true;
         try w.print(
-            "{{\"seq\":{d},\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\"}}\n",
-            .{seq},
+            "{{\"seq\":{d},\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"spec_rev\":{d}}}\n",
+            .{ seq, SpecRev },
         );
     }
 }
@@ -586,6 +591,55 @@ fn handleAppend(
     try w.print("{{\"seq\":{d},\"ok\":true,\"head\":", .{seq});
     try json.writeNullableString(w, new_head);
     try w.writeAll("}\n");
+}
+
+test "hello reply announces the embedded spec revision" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .root_path = "unused" };
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try handleLine(
+        std.testing.io,
+        allocator,
+        &session,
+        "{\"op\":\"hello\",\"seq\":1,\"proto\":\"FLINT-SYNC/1\"}",
+        &output.writer,
+    );
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "{{\"seq\":1,\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"spec_rev\":{d}}}\n",
+        .{SpecRev},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, output.written());
+    try std.testing.expect(SpecRev > 0);
+}
+
+test "hello auth challenge reply announces the spec revision" {
+    const allocator = std.testing.allocator;
+    var session = Session{
+        .root_path = "unused",
+        .auth_key = @splat(0x11),
+        .fixed_nonce = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    };
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try handleLine(
+        std.testing.io,
+        allocator,
+        &session,
+        "{\"op\":\"hello\",\"seq\":1,\"proto\":\"FLINT-SYNC/1\"}",
+        &output.writer,
+    );
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "{{\"seq\":1,\"ok\":true,\"proto\":\"FLINT-SYNC/1\",\"server\":\"flintd\",\"nonce\":\"{s}\",\"spec_rev\":{d}}}\n",
+        .{ store.encodeLowerHexFixed(16, session.nonce), SpecRev },
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, output.written());
 }
 
 test "request without seq refuses usage" {

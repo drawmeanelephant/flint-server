@@ -99,6 +99,8 @@ the command line or in an issue. See [SECURITY.md](SECURITY.md).
 - `testdata/sig/` — the Ed25519 signature vectors, copied verbatim from
   the Go implementation's `user/go/flint/testdata/`. The Go implementation
   in VirelaiOS stays the reference oracle for store semantics.
+- `SPECREV` + `docs/spec-versioning.md` — the protocol-visible spec
+  revision and the pinning/tagging convention for downstream ports.
 
 ## Tracking
 
