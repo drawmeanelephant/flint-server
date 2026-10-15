@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# tools/live-journey — live TCP dogfood harness for flintd + flint.
+#
+# Runs every scenario in tools/live-journey.d/*.sh against a real flintd
+# listening on a real socket with the real flint client. Failures become
+# structured findings (findings.jsonl + SUMMARY.md) that tools/file-findings
+# turns into GitHub issue drafts.
+#
+# Usage:
+#   tools/live-journey [--scenario <name>] [--findings-dir <dir>]
+#                      [--no-build] [--keep]
+#
+# Env overrides:
+#   FLINTD_BIN        default: built from this repo
+#   FLINT_CLIENT_DIR  default: ../flint-client
+#   FLINT_BIN         default: $FLINT_CLIENT_DIR/zig-out/bin/flint
+#
+# Scenario exit protocol: 0=PASS, 42=KNOWN issue, other=FAIL (new finding),
+# 124=TIMEOUT (treated as FAIL unless the scenario opted into known-issue).
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+SCEN_DIR="$REPO_ROOT/tools/live-journey.d"
+FLINT_CLIENT_DIR="${FLINT_CLIENT_DIR:-$REPO_ROOT/../flint-client}"
+FLINT_BIN="${FLINT_BIN:-$FLINT_CLIENT_DIR/zig-out/bin/flint}"
+FLINTD_BIN="${FLINTD_BIN:-$REPO_ROOT/zig-out/bin/flintd}"
+FINDINGS_DIR=""
+ONLY=""
+BUILD=1
+KEEP=0
+SCENARIO_TIMEOUT="${LJ_SCENARIO_TIMEOUT:-150}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scenario) ONLY="$2"; shift 2 ;;
+    --findings-dir) FINDINGS_DIR="$2"; shift 2 ;;
+    --no-build) BUILD=0; shift ;;
+    --keep) KEEP=1; shift ;;
+    *) echo "usage: live-journey [--scenario n] [--findings-dir d] [--no-build] [--keep]" >&2; exit 2 ;;
+  esac
+done
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+FINDINGS_DIR="${FINDINGS_DIR:-$REPO_ROOT/.dogfood/$TS}"
+mkdir -p "$FINDINGS_DIR"
+
+# --- build -----------------------------------------------------------------
+if [[ $BUILD -eq 1 ]]; then
+  echo "== building flintd =="
+  zig build || { echo "server build failed" >&2; exit 1; }
+  if [[ -d "$FLINT_CLIENT_DIR" ]]; then
+    echo "== building flint ($FLINT_CLIENT_DIR) =="
+    (cd "$FLINT_CLIENT_DIR" && zig build) || { echo "client build failed" >&2; exit 1; }
+  fi
+fi
+[[ -x "$FLINTD_BIN" ]] || { echo "missing flintd: $FLINTD_BIN" >&2; exit 1; }
+[[ -x "$FLINT_BIN" ]] || { echo "missing flint: $FLINT_BIN (set FLINT_BIN or FLINT_CLIENT_DIR)" >&2; exit 1; }
+
+SERVER_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+CLIENT_SHA="$(git -C "$FLINT_CLIENT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
+echo "== live-journey $TS =="
+echo "   flintd=$SERVER_SHA ($FLINTD_BIN)"
+echo "   flint =$CLIENT_SHA ($FLINT_BIN)"
+echo "   findings: $FINDINGS_DIR"
+
+WORK_ROOT="$(mktemp -d)"
+cleanup() {
+  pkill -f "flintd serve --store=$WORK_ROOT" 2>/dev/null
+  [[ $KEEP -eq 0 ]] && rm -rf "$WORK_ROOT"
+}
+trap cleanup EXIT
+
+FINDINGS_JSONL="$FINDINGS_DIR/findings.jsonl"
+: >"$FINDINGS_JSONL"
+
+json_line() { # json_line <scenario> <status> <log> — harvest markers, append jsonl
+  python3 - "$1" "$2" "$3" "$FINDINGS_JSONL" "$SERVER_SHA" "$CLIENT_SHA" "$TS" <<'PY'
+import json, sys, re
+scenario, status, log, out, ssha, csha, ts = sys.argv[1:8]
+text = open(log, errors="replace").read()
+def last(mark):
+    m = re.findall(rf"^{mark}: (.*)$", text, re.M)
+    return m[-1] if m else ""
+known = last("KNOWN_ISSUE")
+rec = {
+    "scenario": scenario, "status": status, "known_issue": known,
+    "repo": last("FINDING_REPO") or "flint-server",
+    "step": last("STEP"), "expected": last("EXPECTED"), "actual": last("ACTUAL"),
+    "log": log, "server_sha": ssha, "client_sha": csha, "ts": ts,
+}
+with open(out, "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+}
+
+pass=0; known=0; fail=0
+for f in "$SCEN_DIR"/[0-9]*.sh; do
+  name="$(basename "$f" .sh)"
+  [[ -n "$ONLY" && "$name" != "$ONLY" ]] && continue
+
+  export SCENARIO_DIR="$WORK_ROOT/$name"
+  mkdir -p "$SCENARIO_DIR"
+  export FLINTD="$FLINTD_BIN" FLINT="$FLINT_BIN" LJ_LIB="$SCEN_DIR/lib.sh"
+  log="$FINDINGS_DIR/$name.log"
+
+  timeout "$SCENARIO_TIMEOUT" bash "$f" >"$log" 2>&1
+  rc=$?
+  # Scenarios that exit early may leave their flintd running; reap it.
+  pkill -f "flintd serve --store=$SCENARIO_DIR" 2>/dev/null
+
+  case $rc in
+    0)  status=PASS;    pass=$((pass+1)) ;;
+    42) status=KNOWN;   known=$((known+1)) ;;
+    124) status=TIMEOUT; fail=$((fail+1)) ;;
+    *)  status=FAIL;    fail=$((fail+1)) ;;
+  esac
+  json_line "$name" "$status" "$log"
+  printf '   %-28s %s\n' "$name" "$status"
+done
+
+# --- summary ----------------------------------------------------------------
+SUMMARY="$FINDINGS_DIR/SUMMARY.md"
+{
+  echo "# live-journey $TS"
+  echo
+  echo "- flintd @ \`$SERVER_SHA\`, flint @ \`$CLIENT_SHA\`"
+  echo "- **$pass pass, $known known-issue, $fail failing**"
+  echo
+  echo "| scenario | status | known issue | step |"
+  echo "|---|---|---|---|"
+  python3 - "$FINDINGS_JSONL" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    print(f"| {r['scenario']} | {r['status']} | {r['known_issue']} | {r['step']} |")
+PY
+  echo
+  echo "Per-scenario logs live next to this file. Run:"
+  echo "  tools/file-findings $FINDINGS_DIR           # draft issues"
+  echo "  tools/file-findings $FINDINGS_DIR --create  # file them on GitHub"
+} >"$SUMMARY"
+
+echo
+echo "== $pass pass, $known known, $fail fail — $SUMMARY =="
+[[ $fail -eq 0 ]]
