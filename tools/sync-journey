@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+zig build
+FLINTD="$REPO_ROOT/zig-out/bin/flintd"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+STORE_DIR="$TMP_DIR/server-store"
+
+# 1. flintd init
+init_out="$("$FLINTD" init --store="$STORE_DIR")"
+if [[ "$init_out" != "flintd: init ok store=$STORE_DIR" ]]; then
+  echo "FAIL: unexpected init output: $init_out" >&2
+  exit 1
+fi
+
+# Re-init must refuse stream_exists with exit 1.
+if "$FLINTD" init --store="$STORE_DIR" 2>"$TMP_DIR/reinit.err"; then
+  echo "FAIL: expected re-init to fail" >&2
+  exit 1
+fi
+grep -q "flintd: refuse stream_exists" "$TMP_DIR/reinit.err"
+
+# 2. Client A Session (--stdio): create main, append c1 & c2, open, heads, read.
+grep '^> ' testdata/sync/push_pull.ndjson | sed 's/^> //' > "$TMP_DIR/client_a.req"
+grep '^< ' testdata/sync/push_pull.ndjson | sed 's/^< //' > "$TMP_DIR/client_a.exp"
+
+"$FLINTD" serve --store="$STORE_DIR" --stdio < "$TMP_DIR/client_a.req" > "$TMP_DIR/client_a.got" 2>"$TMP_DIR/client_a.err"
+grep -q "flintd: ready" "$TMP_DIR/client_a.err"
+diff -u "$TMP_DIR/client_a.exp" "$TMP_DIR/client_a.got"
+
+# 3. Verify on-disk store portability: streams/<id>.json and streams/<id>.jsonl exist and end with newline.
+STREAM_ID="0199de2d-dc00-7000-8000-000000000010"
+test -f "$STORE_DIR/streams/$STREAM_ID.json"
+test -f "$STORE_DIR/streams/$STREAM_ID.jsonl"
+test "$(wc -l < "$STORE_DIR/streams/$STREAM_ID.jsonl")" -eq 2
+
+# 4. If companion flint client binary is available, run flint verify against the server store.
+FLINT_BIN="${FLINT_BIN:-$REPO_ROOT/../flint-client/zig-out/bin/flint}"
+if [[ -x "$FLINT_BIN" ]]; then
+  "$FLINT_BIN" verify --store="$STORE_DIR" --all
+fi
+
+echo "sync-journey: ok"
