@@ -22,9 +22,10 @@ scope), `docs/adr-0049.md`, and the merged wave-1 specs
   the server (§6).
 - The wire contract grows by **appending ops only**. Envelope, `seq`,
   one-request-in-flight, and the refusal vocabulary are contractual.
-  A new server must degrade old clients via `proto_version`, never
-  fail them — the degraded-mode rule the blobs spec §4 already
-  prescribes.
+  A new client facing an old server maps its unknown-op refusal to
+  `proto_version` and degrades, never fails — the degraded-mode rule
+  the blobs spec §4 already prescribes. Old clients never send ops a
+  server doesn't know, so they never see the refusal.
 - No new dependencies for transport security: stdlib crypto only
   (HMAC-SHA256 auth exists; a Noise handshake is implementable from
   `std.crypto` primitives if flintd is ever exposed beyond tunnels).
@@ -40,8 +41,10 @@ scope), `docs/adr-0049.md`, and the merged wave-1 specs
 A git server today is either ssh + git-shell (OS accounts, shell
 surface, per-host setup) or a hosted web product (weight, vendor
 lock). flintd is one static binary with HMAC auth, an author
-allowlist, bounded stores, and a serial accept loop that cannot be
-starved. For an agent fleet it adds what no git server has: signed
+allowlist, bounded stores, and a serial accept loop that idle clients
+cannot starve — reads are deadline-bounded, though a stalled reader
+of a large `read` response can still hold the loop (writes carry no
+deadline). For an agent fleet it adds what no git server has: signed
 in-store proposals, per-stream policy, and a contractual machine
 protocol. This document lists what flintd still needs to back the
 client-end vision end to end.
@@ -55,7 +58,7 @@ client-end vision end to end.
 | No author-level gate | `--allow-author` allowlist enforced at `append` (`author_not_allowed`) |
 | Idle connections starve all clients (our own #9) | `--read-timeout` bounds every read; serial accept by design (§3.3) |
 | Stores grow forever, unverifiable | bounded logs (4 MiB / 4096 per stream), torn logs refuse, `verify --all` always available client-side |
-| Health is guesswork | `tools/healthcheck.py` probes auth handshakes, invalid-key refusal, deadlines, response hygiene (`--prometheus` mode) |
+| Health is guesswork | `tools/healthcheck.py` probes auth handshake, deadline, response hygiene (`--prometheus` mode); invalid-key refusal lives in `tools/tcp-smoke.py` / live-journey 040 |
 | PRs live outside the VCS (GitHub/GitLab) | proposals as signed in-store objects (V6, wave 3) |
 | Mirrors are fragile scripts | federation is the same append protocol (V7, wave 3) |
 
@@ -63,7 +66,9 @@ client-end vision end to end.
 
 "Today" = the §2.2 verb table (`hello`, `auth`, `list`, `heads`,
 `open`, `read`, `create`, `append`) plus `--listen` / `--stdio` /
-`--auth-key` / `--allow-author` / `--read-timeout` / `max_conns`.
+`--auth-key` / `--allow-author` / `--read-timeout` — and a latent
+`max_conns` param on `serveTcp` (`main.zig` passes `null`; no flag
+exposes it).
 
 Notably, spec §7 already names several gaps as v1 out-of-scope —
 **per-stream ACLs, quotas, rate limits, discovery, multi-store
@@ -78,7 +83,7 @@ not scope creep.
 | stream namespaces (`team/stream`) | flat stream ids | V1 |
 | per-author quotas / rate limits | global store bounds only | V2 |
 | whole-store backup / export as a bundle | none | V8 (pairs P1–P2) |
-| admin verbs (list streams, verify, gc, backup) | `init` / `serve` only | V9 |
+| admin verbs (list streams, gc, backup, offline store audit — signature `verify` stays client-side per spec §3.4) | `init` / `serve` only | V9 |
 | observability (structured logs, metrics) | healthcheck probe only | V10 |
 | proposals hosting (`propose` / `proposals` / `approve`, signed) | none | V6 (pairs client proposals) |
 | server-side policy hooks (wasm/QuickJS pre-append) | none | V12 (pairs G8) |
@@ -111,8 +116,9 @@ safe to expose and cheap to run at monorepo scale.
 ### 5.1 Ops append only
 
 New ops join the §2.2 table in order. Old servers refuse unknown
-ops; old clients map that to `proto_version` and degrade (never
-fail). No op is ever renamed or removed; refusal names are
+ops (`usage`); new clients map that refusal to `proto_version` and
+degrade — never fail. Old clients never send the new ops, so they
+never see it. No op is ever renamed or removed; refusal names are
 contractual.
 
 ### 5.2 Auth model (V1)
@@ -127,10 +133,12 @@ later want signed ACLs, that is a new arc, not a patch.
 
 ### 5.3 Quotas (V2)
 
-Enforced at `append` with existing refusals (`store_too_large`,
-`change_too_large`). Per-author counters live outside the store root
-(next to `--auth-key`). Quotas bound abuse, not creativity: defaults
-off, operator-set.
+Enforced at `append` under a distinct refusal — `quota_exceeded`,
+a proposed new contractual name the V2 spec assigns. Reusing
+`store_too_large` would conflate a permanent bound with a policy
+condition, and `change_too_large` is ws-spec-only so far. Per-author
+counters live outside the store root (next to `--auth-key`). Quotas
+bound abuse, not creativity: defaults off, operator-set.
 
 ### 5.4 Proposals (V6)
 
@@ -144,9 +152,10 @@ consistent with §3.4's opaque-payload philosophy.
 ### 5.5 Federation (V7)
 
 A mirror is a client of another flintd: existing `push`/`pull` over
-tcp or ssh (T1–T3). V7 adds discovery (which streams a peer serves)
-and conflict policy (fast-forward only; divergence is a human
-decision surfaced as a refusal). No new wire ops.
+tcp or ssh (T1–T3). V7 adds discovery — which streams a peer serves,
+answered by `list` — and conflict policy (fast-forward only;
+divergence is a human decision surfaced as a refusal). No new wire
+ops unless the V7 spec finds `list` insufficient.
 
 ### 5.6 Observability (V10)
 
