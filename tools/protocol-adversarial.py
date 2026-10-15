@@ -50,7 +50,12 @@ class Conn:
     def recv_line(self, timeout=5):
         self.sock.settimeout(timeout)
         while b"\n" not in self.buf:
-            chunk = self.sock.recv(65536)
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                # A hung server must surface as a failed check, not a
+                # traceback that aborts the whole run.
+                return "<timeout>"
             if not chunk:
                 line, self.buf = self.buf, b""
                 return line.decode(errors="replace") if line else None
@@ -61,7 +66,13 @@ class Conn:
     def call(self, req):
         self.send_raw(json.dumps(req, separators=(",", ":")).encode() + b"\n")
         line = self.recv_line()
-        return json.loads(line) if line else None
+        if line is None:
+            return None
+        try:
+            return json.loads(line)
+        except ValueError:
+            # Non-JSON reply or a recv timeout: fail the check, keep the run.
+            return {"_transport": line}
 
     def close(self):
         try:
@@ -100,15 +111,26 @@ def start(store, extra=()):
     ready, _, _ = select.select([proc.stderr], [], [], 5)
     if not ready:
         proc.kill()
+        proc.wait(5)
         raise RuntimeError("server did not start")
     first = proc.stderr.readline()
     match = re.fullmatch(r"flintd: listening 127\.0\.0\.1:(\d+)\n", first)
     if not match:
         proc.kill()
+        proc.wait(5)
         raise RuntimeError("unexpected startup line: %r" % first)
     # Drain stderr so logging can never block the server during the run.
     threading.Thread(target=lambda: [None for _ in proc.stderr], daemon=True).start()
     return proc, int(match[1])
+
+
+def stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(5)
 
 
 def hello(port):
@@ -175,23 +197,40 @@ def test_framing_and_envelope(port):
     # Duplicate keys and unknown fields must not change behaviour.
     c.send_raw(b'{"op":"list","seq":5,"seq":6,"extra":{"a":[1,2]}}\n')
     line = c.recv_line()
-    check("duplicate/unknown keys do not crash", line is not None and json.loads(line).get("seq") in (5, 6, 0), line)
+    resp = json.loads(line) if line and line.startswith("{") else {}
+    check("duplicate/unknown keys do not crash", resp.get("seq") in (5, 6, 0), line)
     c.close()
 
 
 def test_pipelining_and_split_frames(port):
     c = hello(port)
     c.send_raw(b'{"op":"list","seq":10}\n{"op":"heads","seq":11}\n{"op":"list","seq":12}\n')
-    seqs = [json.loads(c.recv_line())["seq"] for _ in range(3)]
-    check("pipelined requests answered in order", seqs == [10, 11, 12], seqs)
-    frame = b'{"op":"heads","seq":13}\n'
-    for byte in frame:
-        c.send_raw(bytes([byte]))
-    r = json.loads(c.recv_line())
-    check("byte-at-a-time frame is reassembled", r.get("seq") == 13 and r.get("ok") is True, r)
-    c.send_raw(b'{"op":"list","seq":14}\r\n')
-    line = c.recv_line()
-    check("CRLF framing tolerated or refused cleanly", line is not None and json.loads(line).get("seq") in (14, 0), line)
+    # Spec 2.1 puts one request in flight per connection, so pipelining is a
+    # client violation: closing is as legal as answering. Assert only that
+    # replies are never reordered — an in-order prefix then EOF, or all three.
+    seqs = []
+    closed = False
+    for _ in range(3):
+        line = c.recv_line(3)
+        if line is None:
+            closed = True
+            break
+        if not line.startswith("{"):
+            break
+        seqs.append(json.loads(line).get("seq"))
+    check("pipelined requests answered in order or connection closed",
+          seqs == [10, 11, 12][:len(seqs)] and (closed or len(seqs) == 3), (seqs, closed))
+    if not closed:
+        frame = b'{"op":"heads","seq":13}\n'
+        for byte in frame:
+            c.send_raw(bytes([byte]))
+        line = c.recv_line()
+        resp = json.loads(line) if line and line.startswith("{") else {}
+        check("byte-at-a-time frame is reassembled", resp.get("seq") == 13 and resp.get("ok") is True, line)
+        c.send_raw(b'{"op":"list","seq":14}\r\n')
+        line = c.recv_line()
+        resp = json.loads(line) if line and line.startswith("{") else {}
+        check("CRLF framing tolerated or refused cleanly", resp.get("seq") in (14, 0), line)
     c.close()
 
 
@@ -200,9 +239,10 @@ def test_oversize(port):
     c.send_raw(b'{"op":"list","seq":1,"pad":"' + b"A" * (4 * 1024 * 1024 + 1024) + b'"}\n')
     try:
         line = c.recv_line(10)
-    except (ConnectionError, socket.timeout) as exc:
+    except ConnectionError as exc:
         line = "<closed: %s>" % type(exc).__name__
-    ok = line is None or line.startswith("<closed") or refused(json.loads(line), "store_too_large")
+    resp = json.loads(line) if line and line.startswith("{") else None
+    ok = line is None or line.startswith("<closed") or refused(resp, "store_too_large")
     check("line over 4 MiB refuses store_too_large or closes", ok, (line or "")[:120])
     c.close()
     check("server alive after oversize line", alive(port))
@@ -211,7 +251,10 @@ def test_oversize(port):
 def test_handshake(port):
     c = Conn(port)
     r = c.call({"op": "list", "seq": 1})
-    check("op before hello is not served silently", r is None or r.get("ok") is False or r.get("ok") is True, r)
+    check("list before hello is served; hello gates auth only (spec 3.2)",
+          r is not None and r.get("ok") is True and r.get("seq") == 1, r)
+    r = c.call({"op": "auth", "seq": 2, "nonce": "00" * 16, "hmac": "00" * 32})
+    check("auth with no --auth-key refuses usage without closing", refused(r, "usage"), r)
     c.close()
     for proto in ["", "FLINT-SYNC/0", "flint-sync/1", "FLINT-SYNC/1 ", None, 1]:
         conn = Conn(port)
@@ -286,8 +329,8 @@ def test_append_validation(port, changes):
     check("non-JSON change is change_malformed", refused(r, "change_malformed"), r)
     r = c.call({**base, "seq": 6, "expected_head": None, "changes": [42]})
     check("non-string change entry is rejected", r is not None and r.get("ok") is False, r)
-    r = c.call({**base, "seq": 7, "expected_head": None, "changes": changes[0].replace(STREAM, "0199de2d-dc00-7000-8000-0000000000aa")
-                if False else [changes[0].replace('"stream":"%s"' % STREAM, '"stream":"0199de2d-dc00-7000-8000-0000000000aa"')]})
+    foreign = changes[0].replace('"stream":"%s"' % STREAM, '"stream":"0199de2d-dc00-7000-8000-0000000000aa"')
+    r = c.call({**base, "seq": 7, "expected_head": None, "changes": [foreign]})
     check("change for a different stream is change_malformed", refused(r, "change_malformed") or refused(r, "sig_invalid"), r)
 
     tampered = changes[0].replace("pinned vector change", "pinned vector changf")
@@ -415,9 +458,11 @@ def test_connection_stress(port):
     check("stress run completed in reasonable time", time.time() - start_time < 90, time.time() - start_time)
 
 
-def test_concurrent_append_race(port, directory):
+def test_concurrent_create_race(port):
     sid = "0199de2d-dc00-7000-8000-000000000030"
-    # The pinned vectors are bound to STREAM, so race create instead of append.
+    # The pinned vectors are bound to STREAM, so no second valid append batch
+    # exists to race with; race create instead and assert single-winner
+    # semantics.
     outcomes = []
 
     def racer():
@@ -451,8 +496,7 @@ def test_persistence_and_recovery(store, changes, head):
         check("changes survive a server restart byte-identically", r.get("changes") == changes and r.get("head") == head, str(r)[:160])
         c.close()
     finally:
-        proc.terminate()
-        proc.wait(5)
+        stop(proc)
 
     log = store / "streams" / (STREAM + ".jsonl")
     original = log.read_bytes()
@@ -471,8 +515,7 @@ def test_persistence_and_recovery(store, changes, head):
     try:
         check("store serves again once the damage is repaired", alive(port))
     finally:
-        proc.terminate()
-        proc.wait(5)
+        stop(proc)
 
 
 def startup_refusal(store, name):
@@ -482,6 +525,7 @@ def startup_refusal(store, name):
         err = proc.communicate(timeout=5)[1]
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(5)
         return False
     named = "flintd: refuse " + (name or "")
     return proc.returncode == 1 and named in err and "panic" not in err and "listening" not in err
@@ -497,6 +541,11 @@ def test_auth(directory, changes):
     try:
         import hashlib
         import hmac
+        c = Conn(port)
+        r = c.call({"op": "auth", "seq": 1, "nonce": "00" * 16, "hmac": "00" * 32})
+        check("auth before hello refuses auth_failed", refused(r, "auth_failed"), r)
+        check("connection closes after auth before hello", c.recv_line(3) is None)
+        c.close()
         c = Conn(port)
         r = c.call({"op": "hello", "seq": 1, "proto": PROTO})
         nonce = r.get("nonce")
@@ -522,7 +571,8 @@ def test_auth(directory, changes):
         nonce = c.call({"op": "hello", "seq": 1, "proto": PROTO})["nonce"]
         mac = hmac.new(key, b"FLINT-SYNC-AUTH/1\x00" + bytes.fromhex(nonce), hashlib.sha256).hexdigest()
         r = c.call({"op": "auth", "seq": 2, "nonce": nonce, "hmac": mac.upper()})
-        check("uppercase hmac is rejected or accepted deterministically", r is not None and "ok" in r, r)
+        check("uppercase hmac refuses auth_failed (hex is lowercase-only)", refused(r, "auth_failed"), r)
+        check("connection closes after uppercase-hmac refusal", c.recv_line(3) is None)
         c.close()
 
         c = Conn(port)
@@ -548,8 +598,7 @@ def test_auth(directory, changes):
         c2.close()
         check("auth server alive after abuse", proc.poll() is None)
     finally:
-        proc.terminate()
-        proc.wait(5)
+        stop(proc)
 
 
 def test_allow_author(directory, changes):
@@ -566,8 +615,7 @@ def test_allow_author(directory, changes):
         check("disallowed author left no log", r.get("changes") == [], r)
         c.close()
     finally:
-        proc.terminate()
-        proc.wait(5)
+        stop(proc)
 
 
 def test_cli(directory):
@@ -592,6 +640,16 @@ def test_cli(directory):
     check("re-init of an existing store does not clobber or crash", p.returncode in (0, 1), (p.returncode, p.stderr))
 
 
+def run_test(fn, *args):
+    # A transport error (timeout, reset, wedge) fails the one check scope that
+    # hit it instead of aborting the whole run with a traceback.
+    try:
+        return fn(*args)
+    except Exception as exc:
+        check(fn.__name__, False, "crashed: %s: %s" % (type(exc).__name__, exc))
+        return None
+
+
 def main():
     if not BINARY.exists():
         print("build first: zig build", file=sys.stderr)
@@ -601,25 +659,25 @@ def main():
         directory = Path(tmp)
         store = new_store(directory, "store")
         proc, port = start(store, ["--read-timeout=1"])
+        head = None
         try:
-            test_framing_and_envelope(port)
-            test_pipelining_and_split_frames(port)
-            test_handshake(port)
-            test_stream_lifecycle(port, changes)
-            head = test_append_validation(port, changes)
-            test_read_semantics(port, changes, head)
-            test_fork_chain(port, changes, head)
-            test_oversize(port)
-            test_connection_stress(port)
-            test_concurrent_append_race(port, directory)
+            run_test(test_framing_and_envelope, port)
+            run_test(test_pipelining_and_split_frames, port)
+            run_test(test_handshake, port)
+            run_test(test_stream_lifecycle, port, changes)
+            head = run_test(test_append_validation, port, changes)
+            run_test(test_read_semantics, port, changes, head)
+            run_test(test_fork_chain, port, changes, head)
+            run_test(test_oversize, port)
+            run_test(test_connection_stress, port)
+            run_test(test_concurrent_create_race, port)
             check("server process still running at end of run", proc.poll() is None)
         finally:
-            proc.terminate()
-            proc.wait(5)
-        test_persistence_and_recovery(store, changes, head)
-        test_auth(directory, changes)
-        test_allow_author(directory, changes)
-        test_cli(directory)
+            stop(proc)
+        run_test(test_persistence_and_recovery, store, changes, head)
+        run_test(test_auth, directory, changes)
+        run_test(test_allow_author, directory, changes)
+        run_test(test_cli, directory)
     failed = [r for r in RESULTS if not r[1]]
     print("\n%d checks, %d failed" % (len(RESULTS), len(failed)))
     return 1 if failed else 0
