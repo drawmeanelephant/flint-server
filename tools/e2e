@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# tools/e2e: live two-client TCP sync journey — the spec §5 "sync journey"
+# conformance leg, run against the real flintd daemon and flint client over
+# real TCP. Unlike tools/sync-journey (golden NDJSON over --stdio), this
+# exercises clone/push/pull/--reset/merge divergence recovery end to end.
+#
+# Usage: tools/e2e
+#   FLINTD — path to flintd binary (default: <repo>/zig-out/bin/flintd)
+#   FLINT  — path to flint binary  (default: <repo>/../flint-client/zig-out/bin/flint)
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FLINTD="${FLINTD:-$REPO_ROOT/zig-out/bin/flintd}"
+FLINT="${FLINT:-$REPO_ROOT/../flint-client/zig-out/bin/flint}"
+
+[[ -x $FLINTD ]] || { echo "e2e: flintd not found at $FLINTD (zig build, or set FLINTD)" >&2; exit 1; }
+[[ -x $FLINT ]]  || { echo "e2e: flint not found at $FLINT (build flint-client, or set FLINT)" >&2; exit 1; }
+
+TMP_DIR="$(mktemp -d)"
+PIDS=()
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+CHECKS=0
+fail() { echo "e2e: FAIL: $*" >&2; exit 1; }
+ok()   { CHECKS=$((CHECKS + 1)); printf 'ok %d - %s\n' "$CHECKS" "$1"; }
+
+# expect <want_rc> <want_substring> -- <cmd...>
+expect() {
+  local want_rc="$1" want_sub="$2"; shift 3
+  local out rc=0
+  out="$("$@" 2>&1)" || rc=$?
+  [[ $rc == "$want_rc" ]] || fail "rc=$rc want=$want_rc: $* -> $out"
+  [[ -z $want_sub || $out == *"$want_sub"* ]] || fail "want '$want_sub' in output: $* -> $out"
+  ok "$* -> $want_sub"
+}
+
+# start_flintd <store> [extra serve flags...] -> sets URL from the listening banner
+start_flintd() {
+  local store="$1"; shift
+  local log="$TMP_DIR/flintd.${#PIDS[@]}.log"
+  "$FLINTD" serve --store="$store" --listen=127.0.0.1:0 "$@" >"$log.out" 2>"$log" &
+  PIDS+=("$!")
+  local line="" tries=0
+  while [[ -z $line && $tries -lt 200 ]]; do
+    line="$(grep -o 'listening .*' "$log" 2>/dev/null | head -1 || true)"
+    [[ -z $line ]] && { sleep 0.05; tries=$((tries + 1)); }
+  done
+  [[ -n $line ]] || fail "flintd printed no listening banner: $(cat "$log")"
+  URL="tcp://${line#listening }"
+}
+
+write_src() { # <dir> <x> <y>
+  cat > "$1/calc.go" <<SRC
+package calc
+
+func X() int {
+	return $2
+}
+
+func Y() int {
+	return $3
+}
+SRC
+}
+
+SERVER_STORE="$TMP_DIR/server-store"
+A_STORE="$TMP_DIR/a-store"
+B_STORE="$TMP_DIR/b-store"
+C_STORE="$TMP_DIR/c-store"
+SRCA="$TMP_DIR/src-a"
+SRCB="$TMP_DIR/src-b"
+mkdir -p "$SRCA" "$SRCB"
+write_src "$SRCA" 1 2
+write_src "$SRCB" 1 2
+
+# --- Leg 1: daemon init + TCP serve (ephemeral port) -------------------------
+expect 0 "flintd: init ok" -- "$FLINTD" init --store="$SERVER_STORE"
+start_flintd "$SERVER_STORE"
+URL1="$URL"
+
+# --- Leg 2: A init -> keygen -> commit c1 -> push ----------------------------
+expect 0 "flint: init ok ws=a stream=main" -- "$FLINT" --store="$A_STORE" init --name=a --src="$SRCA"
+A_PUB="$("$FLINT" --store="$A_STORE" keygen --name=a | awk '{print $3}')"
+[[ $A_PUB =~ ^[0-9a-f]{64}$ ]] || fail "unexpected keygen output: $A_PUB"
+ok "keygen a -> ${A_PUB:0:8}..."
+expect 0 "flint: add" -- "$FLINT" --store="$A_STORE" add --ws=a
+expect 0 "flint: commit ok" -- "$FLINT" --store="$A_STORE" commit --key=a -m c1
+expect 0 "flint: push ok stream=main changes=1" -- "$FLINT" --store="$A_STORE" push --remote="$URL1"
+expect 0 "flint: push up to date" -- "$FLINT" --store="$A_STORE" push
+
+# --- Leg 3: auth + author allowlist on a second daemon -----------------------
+# Run while A's log is all-A-authored so the positive push stays clean.
+SERVER2_STORE="$TMP_DIR/server2-store"
+AUTH_KEY="$TMP_DIR/auth.key"
+WRONG_KEY="$TMP_DIR/wrong.key"
+ALLOW="$TMP_DIR/allow-authors.txt"
+printf 'a5%.0s' $(seq 32) > "$AUTH_KEY"; printf '\n' >> "$AUTH_KEY"
+printf '00%.0s' $(seq 32) > "$WRONG_KEY"; printf '\n' >> "$WRONG_KEY"
+printf '%s\n' "$A_PUB" > "$ALLOW"
+
+expect 0 "flintd: init ok" -- "$FLINTD" init --store="$SERVER2_STORE"
+start_flintd "$SERVER2_STORE" --auth-key="$AUTH_KEY" --allow-author="$ALLOW"
+URL2="$URL"
+
+expect 1 "flint: refuse auth_required" -- "$FLINT" --store="$A_STORE" push --remote="$URL2"
+expect 1 "flint: refuse auth_failed"  -- "$FLINT" --store="$A_STORE" push --remote="$URL2" --auth-key="$WRONG_KEY"
+expect 0 "flint: push ok stream=main changes=1" -- \
+  "$FLINT" --store="$A_STORE" push --remote="$URL2" --auth-key="$AUTH_KEY"
+
+# B clones server2's main (auth required on read too), then commits a
+# B-authored change and is refused by the allowlist.
+expect 1 "flint: refuse auth_required" -- \
+  "$FLINT" --store="$B_STORE" clone "$URL2" --stream=main --name=b --src="$SRCB"
+expect 0 "flint: clone ok stream=main changes=1" -- \
+  "$FLINT" --store="$B_STORE" clone "$URL2" --stream=main --name=b --src="$SRCB" --auth-key="$AUTH_KEY"
+B_PUB="$("$FLINT" --store="$B_STORE" keygen --name=b | awk '{print $3}')"
+[[ $B_PUB =~ ^[0-9a-f]{64}$ ]] || fail "unexpected keygen output: $B_PUB"
+ok "keygen b -> ${B_PUB:0:8}..."
+write_src "$SRCB" 1 999
+expect 0 "flint: add" -- "$FLINT" --store="$B_STORE" add --ws=b
+expect 0 "flint: commit ok" -- "$FLINT" --store="$B_STORE" commit --key=b -m diverged
+expect 1 "flint: refuse author_not_allowed" -- \
+  "$FLINT" --store="$B_STORE" push --remote="$URL2" --auth-key="$AUTH_KEY"
+
+# --- Leg 4: A advances remote main on server1; B diverges and recovers -------
+write_src "$SRCA" 10 2
+expect 0 "flint: add" -- "$FLINT" --store="$A_STORE" add --ws=a
+expect 0 "flint: commit ok" -- "$FLINT" --store="$A_STORE" commit --key=a -m c2
+expect 0 "flint: push ok stream=main changes=1" -- "$FLINT" --store="$A_STORE" push --remote="$URL1"
+
+# B pushes its divergent head to server1: stale_head, then fork_needed on
+# pull (and on pull --reset until the divergent change is forked aside).
+expect 1 "flint: refuse stale_head"  -- "$FLINT" --store="$B_STORE" push --ws=b --remote="$URL1"
+expect 1 "flint: refuse fork_needed" -- "$FLINT" --store="$B_STORE" pull --ws=b --remote="$URL1"
+expect 1 "flint: refuse fork_needed" -- "$FLINT" --store="$B_STORE" pull --ws=b --remote="$URL1" --reset
+expect 0 "flint: fork ok stream=b-work" -- "$FLINT" --store="$B_STORE" fork main b-work
+expect 0 "flint: pull reset stream=main" -- "$FLINT" --store="$B_STORE" pull --ws=b --remote="$URL1" --reset
+expect 0 "flint: merge ok conflicts=0"   -- "$FLINT" --store="$B_STORE" merge --ws=b b-work
+expect 0 "flint: push ok stream=main changes=1" -- "$FLINT" --store="$B_STORE" push --ws=b --remote="$URL1"
+expect 0 "flint: pull ok stream=main changes=1" -- "$FLINT" --store="$A_STORE" pull --ws=a --remote="$URL1"
+
+# --- Leg 5: verify green on every store, including the server's --------------
+expect 0 "sig: verified" -- "$FLINT" --store="$A_STORE" verify --all
+expect 0 "sig: verified" -- "$FLINT" --store="$B_STORE" verify --all
+expect 0 "sig: verified" -- "$FLINT" --store="$SERVER_STORE" verify --all
+
+compgen -G "$SERVER_STORE/streams/*.json"  >/dev/null || fail "no streams/*.json in server store"
+compgen -G "$SERVER_STORE/streams/*.jsonl" >/dev/null || fail "no streams/*.jsonl in server store"
+ok "server store holds streams/*.json + *.jsonl"
+
+# --- Leg 6: re-clone fast-forwards a stale store -----------------------------
+expect 0 "flint: clone ok stream=main" -- \
+  "$FLINT" --store="$C_STORE" clone "$URL1" --stream=main --name=c --src="$TMP_DIR/src-c"
+write_src "$SRCA" 20 2
+expect 0 "flint: add" -- "$FLINT" --store="$A_STORE" add --ws=a
+expect 0 "flint: commit ok" -- "$FLINT" --store="$A_STORE" commit --key=a -m c3
+expect 0 "flint: push ok stream=main changes=1" -- "$FLINT" --store="$A_STORE" push --remote="$URL1"
+expect 0 "flint: clone ok stream=main" -- \
+  "$FLINT" --store="$C_STORE" clone "$URL1" --stream=main --name=c2 --src="$TMP_DIR/src-c2"
+expect 0 "flint: pull ok" -- "$FLINT" --store="$B_STORE" pull --ws=b --remote="$URL1"
+
+# --- Leg 7: concurrent push race ----------------------------------------------
+# A and B commit on the same remote head and push at once; the serialized
+# server must award exactly one win and one stale_head.
+write_src "$SRCA" 30 2
+write_src "$SRCB" 30 999
+expect 0 "flint: add" -- "$FLINT" --store="$A_STORE" add --ws=a
+expect 0 "flint: commit ok" -- "$FLINT" --store="$A_STORE" commit --key=a -m race-a
+expect 0 "flint: add" -- "$FLINT" --store="$B_STORE" add --ws=b
+expect 0 "flint: commit ok" -- "$FLINT" --store="$B_STORE" commit --key=b -m race-b
+
+"$FLINT" --store="$A_STORE" push --ws=a --remote="$URL1" >"$TMP_DIR/push-a.out" 2>&1 &
+pid_a=$!
+"$FLINT" --store="$B_STORE" push --ws=b --remote="$URL1" >"$TMP_DIR/push-b.out" 2>&1 &
+pid_b=$!
+rc_a=0; rc_b=0
+wait "$pid_a" || rc_a=$?
+wait "$pid_b" || rc_b=$?
+out_a="$(cat "$TMP_DIR/push-a.out")"
+out_b="$(cat "$TMP_DIR/push-b.out")"
+if [[ $rc_a == 0 && $out_a == *"push ok"* && $rc_b == 1 && $out_b == *"stale_head"* ]] ||
+   [[ $rc_b == 0 && $out_b == *"push ok"* && $rc_a == 1 && $out_a == *"stale_head"* ]]; then
+  ok "concurrent push: one wins, one sees stale_head (a=$rc_a, b=$rc_b)"
+else
+  fail "concurrent push race: a(rc=$rc_a): $out_a; b(rc=$rc_b): $out_b"
+fi
+
+expect 0 "sig: verified" -- "$FLINT" --store="$SERVER_STORE" verify --all
+
+echo "e2e: ok ($CHECKS checks)"
