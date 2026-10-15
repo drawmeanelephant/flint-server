@@ -80,6 +80,79 @@ pub fn serveStdio(io: Io, allocator: Allocator, cfg: ServeConfig) !void {
     try serveStream(io, allocator, cfg, &stdin_r.interface, &stdout_w.interface);
 }
 
+/// A `Stream.Reader` equivalent for accepted TCP connections that applies
+/// `timeout` to every underlying read, so an idle or stalled peer cannot
+/// starve the serial accept loop (spec §3.3 keeps serialized sessions; the
+/// deadline only bounds how long one session may hold the loop).
+///
+/// The concrete failure — `error.Timeout` when the deadline expires — is
+/// stored in `err` and surfaced through the interface as `error.ReadFailed`,
+/// matching `Io.net.Stream.Reader` conventions.
+pub const TimedReader = struct {
+    interface: Io.Reader,
+    stream: Io.net.Stream,
+    io: Io,
+    timeout: Io.Timeout,
+    err: ?anyerror,
+
+    pub fn init(stream: Io.net.Stream, io: Io, buffer: []u8, timeout: Io.Timeout) TimedReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = streamImpl, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .stream = stream,
+            .io = io,
+            .timeout = timeout,
+            .err = null,
+        };
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *TimedReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const io = r.io;
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        std.debug.assert(dest[0].len > 0);
+
+        var storage: [1]Io.Operation.Storage = undefined;
+        var batch: Io.Batch = .init(&storage);
+        batch.addAt(0, .{ .net_read = .{
+            .socket_handle = r.stream.socket.handle,
+            .data = dest,
+        } });
+        batch.awaitConcurrent(io, r.timeout) catch |err| {
+            batch.cancel(io);
+            r.err = err;
+            return error.ReadFailed;
+        };
+        const completion = batch.next().?;
+        const result = completion.result.net_read catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        if (result.data_len == 0) {
+            return error.EndOfStream;
+        }
+        if (result.data_len > data_size) {
+            io_r.end += result.data_len - data_size;
+            return data_size;
+        }
+        return result.data_len;
+    }
+};
+
 pub fn parseListenAddress(addr_str: []const u8) !Io.net.IpAddress {
     return Io.net.IpAddress.parseLiteral(addr_str) catch {
         const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return error.InvalidAddress;
@@ -96,17 +169,16 @@ pub fn serveTcp(
     cfg: ServeConfig,
     listen_str: []const u8,
     max_conns: ?usize,
+    read_timeout: Io.Timeout,
 ) !void {
     const addr = try parseListenAddress(listen_str);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    {
-        var stderr_buf: [256]u8 = undefined;
-        var stderr_w = Io.File.stderr().writerStreaming(io, &stderr_buf);
-        try stderr_w.interface.print("flintd: listening {f}\n", .{server.socket.address});
-        try stderr_w.interface.flush();
-    }
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_w = Io.File.stderr().writerStreaming(io, &stderr_buf);
+    try stderr_w.interface.print("flintd: listening {f}\n", .{server.socket.address});
+    try stderr_w.interface.flush();
 
     var served: usize = 0;
     while (true) {
@@ -119,12 +191,102 @@ pub fn serveTcp(
         };
         defer stream.close(io);
 
+        stderr_w.interface.print("flintd: connect {f}\n", .{stream.socket.address}) catch {};
+        stderr_w.interface.flush() catch {};
+
         var r_buf: [64 * 1024]u8 = undefined;
         var w_buf: [64 * 1024]u8 = undefined;
-        var net_r = stream.reader(io, &r_buf);
+        var timed_r = TimedReader.init(stream, io, &r_buf, read_timeout);
         var net_w = stream.writer(io, &w_buf);
 
-        serveStream(io, allocator, cfg, &net_r.interface, &net_w.interface) catch {};
+        serveStream(io, allocator, cfg, &timed_r.interface, &net_w.interface) catch |err| {
+            const timed_out = if (timed_r.err) |e| e == error.Timeout else false;
+            const reason: []const u8 = if (timed_out) "idle_timeout" else @errorName(err);
+            stderr_w.interface.print("flintd: disconnect {f} reason={s}\n", .{ stream.socket.address, reason }) catch {};
+            stderr_w.interface.flush() catch {};
+            served += 1;
+            continue;
+        };
+        stderr_w.interface.print("flintd: disconnect {f}\n", .{stream.socket.address}) catch {};
+        stderr_w.interface.flush() catch {};
         served += 1;
     }
+}
+
+test "TimedReader: idle peer surfaces Timeout and ends the session" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const storeio = @import("storeio.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root_path);
+    try storeio.initStore(io, allocator, root_path);
+
+    const listen_addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var r_buf: [4096]u8 = undefined;
+    var timed_r = TimedReader.init(
+        stream,
+        io,
+        &r_buf,
+        .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(50), .clock = .awake } },
+    );
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    // Peer connects but never sends a line: the read deadline must expire.
+    try std.testing.expectError(
+        error.ReadFailed,
+        serveStream(io, allocator, .{ .root_path = root_path }, &timed_r.interface, &out.writer),
+    );
+    try std.testing.expectEqual(error.Timeout, timed_r.err.?);
+}
+
+test "TimedReader: active peer is served normally before the deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const storeio = @import("storeio.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root_path);
+    try storeio.initStore(io, allocator, root_path);
+
+    const listen_addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var client = try server.socket.address.connect(io, .{ .mode = .stream });
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var w_buf: [1024]u8 = undefined;
+    var client_w = client.writer(io, &w_buf);
+    try client_w.interface.writeAll("{\"op\":\"heads\",\"seq\":3}\n");
+    try client_w.interface.flush();
+    client.close(io); // deliver the line, then EOF
+
+    var r_buf: [4096]u8 = undefined;
+    var timed_r = TimedReader.init(
+        stream,
+        io,
+        &r_buf,
+        .{ .duration = .{ .raw = Io.Duration.fromSeconds(5), .clock = .awake } },
+    );
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try serveStream(io, allocator, .{ .root_path = root_path }, &timed_r.interface, &out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"seq\":3,\"ok\":true,\"heads\":{}}\n",
+        out.written(),
+    );
 }
