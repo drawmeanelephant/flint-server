@@ -35,6 +35,27 @@ fn printRefusal(io: Io, code: store.RefusalCode, detail: []const u8) void {
     w.interface.flush() catch {};
 }
 
+fn printUsage(io: Io) void {
+    writeStdout(io, "flintd: usage\n");
+}
+
+fn printHelp(io: Io) void {
+    writeStdout(io,
+        \\usage: flintd <command> [flags]
+        \\
+        \\commands:
+        \\  init --store=<dir>
+        \\      Initialize a store (streams/ + index). --store or FLINT_STORE required.
+        \\  serve --store=<dir> [--stdio | --listen=<host>:<port>]
+        \\        [--auth-key=<file>] [--allow-author=<file>] [--read-timeout=<sec>]
+        \\      Serve the store over stdio or TCP. --stdio and --listen are mutually
+        \\      exclusive; default --listen=127.0.0.1:4748.
+        \\
+        \\note: --store may also come from FLINT_STORE.
+        \\
+    );
+}
+
 fn resolveStoreRoot(flag_store: ?[]const u8, env_map: *const std.process.Environ.Map) ?[]const u8 {
     if (flag_store) |s| {
         if (s.len > 0) return s;
@@ -50,12 +71,22 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printHelp(io);
+            return 0;
+        }
+    }
     if (args.len < 2) {
-        printRefusal(io, .usage, "expected command: init or serve");
+        printUsage(io);
         return 2;
     }
 
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "help")) {
+        printHelp(io);
+        return 0;
+    }
     if (std.mem.eql(u8, cmd, "init")) {
         var flag_store: ?[]const u8 = null;
         var i: usize = 2;
