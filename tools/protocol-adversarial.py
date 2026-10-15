@@ -74,7 +74,6 @@ class Conn:
 # start failing the run (as "fixed, remove from KNOWN") once the bug is fixed.
 KNOWN = {
     "bad envelope refuses usage: missing seq": "#27",
-    "bad listen address exits 2": "#28",
 }
 
 
