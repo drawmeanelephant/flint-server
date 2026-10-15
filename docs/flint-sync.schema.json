@@ -105,6 +105,7 @@
         "proto": {"const": "FLINT-SYNC/1"},
         "server": {"const": "flintd"},
         "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "spec_rev": {"type": "integer", "minimum": 0},
         "streams": {"type": "array", "items": {"$ref": "#/$defs/stream"}},
         "record": {"$ref": "#/$defs/stream"},
         "heads": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nullableUuid"}},
