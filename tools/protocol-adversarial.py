@@ -73,7 +73,6 @@ class Conn:
 # Checks that reproduce a tracked issue report KNOWN instead of failing, and
 # start failing the run (as "fixed, remove from KNOWN") once the bug is fixed.
 KNOWN = {
-    "bad envelope refuses usage: missing seq": "#27",
     "bad listen address exits 2": "#28",
 }
 

@@ -95,6 +95,9 @@ pub fn handleLine(
                 return;
             },
         }
+    } else {
+        try writeRefusal(w, 0, .usage, "missing seq");
+        return;
     }
 
     session.request_seq = @intCast(seq_val);
@@ -583,4 +586,18 @@ fn handleAppend(
     try w.print("{{\"seq\":{d},\"ok\":true,\"head\":", .{seq});
     try json.writeNullableString(w, new_head);
     try w.writeAll("}\n");
+}
+
+test "request without seq refuses usage" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .root_path = "unused" };
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try handleLine(std.testing.io, allocator, &session, "{\"op\":\"list\"}", &output.writer);
+    try std.testing.expectEqualStrings(
+        "{\"seq\":0,\"ok\":false,\"refuse\":\"usage\",\"detail\":\"missing seq\"}\n",
+        output.written(),
+    );
+    try std.testing.expectEqual(@as(?u32, null), session.request_seq);
 }
