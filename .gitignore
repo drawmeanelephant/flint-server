@@ -27,3 +27,6 @@ secrets/
 .vscode/
 *.swp
 *~
+
+# Dogfood harness output
+.dogfood/

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# tools/file-findings — turn live-journey findings into GitHub issue drafts.
+#
+# Usage:
+#   tools/file-findings <findings-dir>            # dry-run: write drafts, print commands
+#   tools/file-findings <findings-dir> --create   # actually file issues via gh
+#
+# FAIL/TIMEOUT findings are deduped against open issues (scenario name in
+# title) before drafting. KNOWN findings are skipped (already tracked).
+set -euo pipefail
+
+DIR="${1:?usage: file-findings <findings-dir> [--create]}"
+CREATE=0
+[[ "${2:-}" == "--create" ]] && CREATE=1
+
+JSONL="$DIR/findings.jsonl"
+[[ -f "$JSONL" ]] || { echo "no findings.jsonl in $DIR" >&2; exit 1; }
+
+mkdir -p "$DIR/issues"
+
+python3 - "$JSONL" "$DIR/issues" <<'PY'
+import json, sys, pathlib
+jsonl, outdir = sys.argv[1], pathlib.Path(sys.argv[2])
+for line in open(jsonl):
+    r = json.loads(line)
+    if r["status"] not in ("FAIL", "TIMEOUT"):
+        continue
+    title = f"[dogfood] {r['scenario']}: {(r['actual'] or r['step'])[:80]}"
+    body = f"""Found by `tools/live-journey` (scenario `{r['scenario']}`).
+
+**Step:** {r['step'] or 'n/a'}
+**Expected:** {r['expected'] or 'n/a'}
+**Actual:** {r['actual'] or 'n/a'}
+
+- flint-server @ `{r['server_sha']}`, flint-client @ `{r['client_sha']}`
+- run: `{r['ts']}`
+- full scenario log: `{r['log']}`
+
+Repro: `tools/live-journey --scenario {r['scenario']}`
+"""
+    (outdir / f"{r['scenario']}.md").write_text(f"TITLE: {title}\n\n{body}")
+    print(f"drafted {r['scenario']} -> {r['repo']}")
+PY
+
+# Dedupe + optionally file.
+python3 - "$JSONL" <<'PY' | while IFS=$'\t' read -r repo scenario title; do
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r["status"] in ("FAIL", "TIMEOUT"):
+        title = f"[dogfood] {r['scenario']}: {(r['actual'] or r['step'])[:80]}"
+        print(f"{r['repo']}\t{r['scenario']}\t{title}")
+PY
+  existing="$(gh issue list -R "drawmeanelephant/$repo" --state open --search "$scenario in:title" --json number,title 2>/dev/null || echo '[]')"
+  if [[ "$existing" != "[]" && -n "$existing" ]]; then
+    echo "SKIP $scenario — matching open issue exists in $repo: $existing"
+    continue
+  fi
+  if [[ $CREATE -eq 1 ]]; then
+    gh label create dogfood -R "drawmeanelephant/$repo" --color BFD4F2 2>/dev/null || true
+    gh issue create -R "drawmeanelephant/$repo" --title "$title" \
+      --body-file "$DIR/issues/$scenario.md" --label dogfood
+  else
+    echo "DRY-RUN would file in $repo: $title"
+    echo "         (body: $DIR/issues/$scenario.md)"
+  fi
+done
+
+echo "done. findings dir: $DIR"
