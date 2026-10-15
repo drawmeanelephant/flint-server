@@ -24,7 +24,14 @@ fn writeStdout(io: Io, msg: []const u8) void {
     w.interface.flush() catch {};
 }
 
-fn printRefusal(io: Io, code: store.RefusalCode, detail: []const u8) void {
+fn refusalExitCode(code: store.RefusalCode) u8 {
+    return switch (code) {
+        .usage => 2,
+        else => 1,
+    };
+}
+
+fn printRefusal(io: Io, code: store.RefusalCode, detail: []const u8) u8 {
     var buf: [512]u8 = undefined;
     var w = Io.File.stderr().writerStreaming(io, &buf);
     if (detail.len > 0) {
@@ -33,6 +40,7 @@ fn printRefusal(io: Io, code: store.RefusalCode, detail: []const u8) void {
         w.interface.print("flintd: refuse {s}\n", .{code.asText()}) catch {};
     }
     w.interface.flush() catch {};
+    return refusalExitCode(code);
 }
 
 fn printUsage(io: Io) void {
@@ -96,31 +104,26 @@ pub fn main(init: std.process.Init) !u8 {
                 flag_store = arg["--store=".len..];
             } else if (std.mem.eql(u8, arg, "--store")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --store");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --store");
                 }
                 i += 1;
                 flag_store = args[i];
             } else {
-                printRefusal(io, .usage, "unknown flag for init");
-                return 2;
+                return printRefusal(io, .usage, "unknown flag for init");
             }
         }
 
         const root_path = resolveStoreRoot(flag_store, init.environ_map) orelse {
-            printRefusal(io, .store_not_found, "no --store and FLINT_STORE unset");
-            return 1;
+            return printRefusal(io, .store_not_found, "no --store and FLINT_STORE unset");
         };
 
         storeio.initStore(io, allocator, root_path) catch |err| switch (err) {
             error.StreamExists => {
-                printRefusal(io, .stream_exists, "streams/ already exists");
-                return 1;
+                return printRefusal(io, .stream_exists, "streams/ already exists");
             },
             else => {
                 const info = storeio.refusalForError(err);
-                printRefusal(io, info.code, info.detail);
-                return 1;
+                return printRefusal(io, info.code, info.detail);
             },
         };
 
@@ -143,8 +146,7 @@ pub fn main(init: std.process.Init) !u8 {
                 flag_store = arg["--store=".len..];
             } else if (std.mem.eql(u8, arg, "--store")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --store");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --store");
                 }
                 i += 1;
                 flag_store = args[i];
@@ -154,8 +156,7 @@ pub fn main(init: std.process.Init) !u8 {
                 listen_addr = arg["--listen=".len..];
             } else if (std.mem.eql(u8, arg, "--listen")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --listen");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --listen");
                 }
                 i += 1;
                 listen_addr = args[i];
@@ -163,8 +164,7 @@ pub fn main(init: std.process.Init) !u8 {
                 auth_key_path = arg["--auth-key=".len..];
             } else if (std.mem.eql(u8, arg, "--auth-key")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --auth-key");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --auth-key");
                 }
                 i += 1;
                 auth_key_path = args[i];
@@ -172,52 +172,43 @@ pub fn main(init: std.process.Init) !u8 {
                 allow_author_path = arg["--allow-author=".len..];
             } else if (std.mem.eql(u8, arg, "--allow-author")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --allow-author");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --allow-author");
                 }
                 i += 1;
                 allow_author_path = args[i];
             } else if (std.mem.startsWith(u8, arg, "--read-timeout=")) {
                 read_timeout_sec = std.fmt.parseInt(u32, arg["--read-timeout=".len..], 10) catch {
-                    printRefusal(io, .usage, "invalid --read-timeout value");
-                    return 2;
+                    return printRefusal(io, .usage, "invalid --read-timeout value");
                 };
             } else if (std.mem.eql(u8, arg, "--read-timeout")) {
                 if (i + 1 >= args.len) {
-                    printRefusal(io, .usage, "missing argument for --read-timeout");
-                    return 2;
+                    return printRefusal(io, .usage, "missing argument for --read-timeout");
                 }
                 i += 1;
                 read_timeout_sec = std.fmt.parseInt(u32, args[i], 10) catch {
-                    printRefusal(io, .usage, "invalid --read-timeout value");
-                    return 2;
+                    return printRefusal(io, .usage, "invalid --read-timeout value");
                 };
             } else {
-                printRefusal(io, .usage, "unknown flag for serve");
-                return 2;
+                return printRefusal(io, .usage, "unknown flag for serve");
             }
         }
 
         if (use_stdio and listen_addr != null) {
-            printRefusal(io, .usage, "cannot specify both --stdio and --listen");
-            return 2;
+            return printRefusal(io, .usage, "cannot specify both --stdio and --listen");
         }
 
         if (read_timeout_sec == 0) {
-            printRefusal(io, .usage, "--read-timeout must be > 0");
-            return 2;
+            return printRefusal(io, .usage, "--read-timeout must be > 0");
         }
 
         const root_path = resolveStoreRoot(flag_store, init.environ_map) orelse {
-            printRefusal(io, .store_not_found, "no --store and FLINT_STORE unset");
-            return 1;
+            return printRefusal(io, .store_not_found, "no --store and FLINT_STORE unset");
         };
 
         var auth_key: ?[32]u8 = null;
         if (auth_key_path) |akp| {
             auth_key = auth.loadAuthKeyFile(io, allocator, akp) catch {
-                printRefusal(io, .secret_malformed, "invalid --auth-key file");
-                return 1;
+                return printRefusal(io, .secret_malformed, "invalid --auth-key file");
             };
         }
 
@@ -225,8 +216,7 @@ pub fn main(init: std.process.Init) !u8 {
         defer if (allow_authors) |aa| allocator.free(aa);
         if (allow_author_path) |aap| {
             allow_authors = auth.loadAllowAuthorFile(io, allocator, aap) catch {
-                printRefusal(io, .secret_malformed, "invalid --allow-author file");
-                return 1;
+                return printRefusal(io, .secret_malformed, "invalid --allow-author file");
             };
         }
 
@@ -234,8 +224,7 @@ pub fn main(init: std.process.Init) !u8 {
         {
             var idx = storeio.loadStoreIndex(io, allocator, root_path) catch |err| {
                 const info = storeio.refusalForError(err);
-                printRefusal(io, info.code, info.detail);
-                return 1;
+                return printRefusal(io, info.code, info.detail);
             };
             idx.deinit(allocator);
         }
@@ -265,15 +254,21 @@ pub fn main(init: std.process.Init) !u8 {
                     "failed to listen on {s}: {s}",
                     .{ bind_str, @errorName(err) },
                 ) catch "failed to listen on address";
-                printRefusal(io, .usage, detail);
-                return 1;
+                return printRefusal(io, .usage, detail);
             };
         }
         return 0;
     } else {
-        printRefusal(io, .usage, "unknown command");
-        return 2;
+        return printRefusal(io, .usage, "unknown command");
     }
+}
+
+test "usage-named refusals exit 2 and other refusals exit 1" {
+    try std.testing.expectEqual(@as(u8, 2), refusalExitCode(.usage));
+    try std.testing.expectEqual(@as(u8, 1), refusalExitCode(.store_not_found));
+    try std.testing.expectEqual(@as(u8, 1), refusalExitCode(.store_missing));
+    try std.testing.expectEqual(@as(u8, 1), refusalExitCode(.secret_malformed));
+    try std.testing.expectEqual(@as(u8, 1), refusalExitCode(.stream_exists));
 }
 
 test {

@@ -72,9 +72,7 @@ class Conn:
 
 # Checks that reproduce a tracked issue report KNOWN instead of failing, and
 # start failing the run (as "fixed, remove from KNOWN") once the bug is fixed.
-KNOWN = {
-    "bad listen address exits 2": "#28",
-}
+KNOWN = {}
 
 
 def check(name, condition, detail=""):
