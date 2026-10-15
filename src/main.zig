@@ -49,7 +49,7 @@ fn printHelp(io: Io) void {
         \\  serve --store=<dir> [--stdio | --listen=<host>:<port>]
         \\        [--auth-key=<file>] [--allow-author=<file>] [--read-timeout=<sec>]
         \\      Serve the store over stdio or TCP. --stdio and --listen are mutually
-        \\      exclusive; default --listen=127.0.0.1:4748.
+        \\      exclusive; default --listen=127.0.0.1:4748, --read-timeout=60 (>0).
         \\
         \\note: --store may also come from FLINT_STORE.
         \\
@@ -203,6 +203,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
+        if (read_timeout_sec == 0) {
+            printRefusal(io, .usage, "--read-timeout must be > 0");
+            return 2;
+        }
+
         const root_path = resolveStoreRoot(flag_store, init.environ_map) orelse {
             printRefusal(io, .store_not_found, "no --store and FLINT_STORE unset");
             return 1;
@@ -211,8 +216,8 @@ pub fn main(init: std.process.Init) !u8 {
         var auth_key: ?[32]u8 = null;
         if (auth_key_path) |akp| {
             auth_key = auth.loadAuthKeyFile(io, allocator, akp) catch {
-                printRefusal(io, .usage, "invalid --auth-key file");
-                return 2;
+                printRefusal(io, .secret_malformed, "invalid --auth-key file");
+                return 1;
             };
         }
 
@@ -220,8 +225,8 @@ pub fn main(init: std.process.Init) !u8 {
         defer if (allow_authors) |aa| allocator.free(aa);
         if (allow_author_path) |aap| {
             allow_authors = auth.loadAllowAuthorFile(io, allocator, aap) catch {
-                printRefusal(io, .usage, "invalid --allow-author file");
-                return 2;
+                printRefusal(io, .secret_malformed, "invalid --allow-author file");
+                return 1;
             };
         }
 
@@ -249,10 +254,10 @@ pub fn main(init: std.process.Init) !u8 {
             };
         } else {
             const bind_str = listen_addr orelse "127.0.0.1:4748";
-            const read_timeout: Io.Timeout = if (read_timeout_sec == 0)
-                .none
-            else
-                .{ .duration = .{ .raw = Io.Duration.fromSeconds(read_timeout_sec), .clock = .awake } };
+            const read_timeout: Io.Timeout = .{ .duration = .{
+                .raw = Io.Duration.fromSeconds(read_timeout_sec),
+                .clock = .awake,
+            } };
             serve.serveTcp(io, allocator, cfg, bind_str, null, read_timeout) catch |err| {
                 var detail_buf: [128]u8 = undefined;
                 const detail = std.fmt.bufPrint(
