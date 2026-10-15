@@ -348,7 +348,6 @@ pub fn parseStreamFromValue(allocator: Allocator, val: std.json.Value) ParseErro
         .forked_from = ff_copy,
     };
     if (!store.validateStreamShape(&st)) {
-        st.deinit(allocator);
         return error.StreamMalformed;
     }
     return st;
@@ -417,6 +416,22 @@ pub fn parseChangeFromValue(allocator: Allocator, val: std.json.Value) ParseErro
         .merged = merged_copy,
         .sig = sig_copy,
     };
+}
+
+test "parseStreamSlice rejects shape-invalid records without double-free" {
+    const cases = [_][]const u8{
+        \\{"id":"0199de2d-dc00-7000-8000-000000000010","name":"main","head":"h","created":1,"forked_from":null}
+        ,
+        \\{"id":"0199de2d-dc00-7000-8000-000000000010","name":"Bad_Name","head":null,"created":1,"forked_from":null}
+        ,
+        \\{"id":"not-a-uuid","name":"main","head":null,"created":1,"forked_from":null}
+        ,
+        \\{"id":"0199de2d-dc00-7000-8000-000000000010","name":"main","head":"h","created":1,"forked_from":{"stream":"s","change":"c"}}
+        ,
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(error.StreamMalformed, parseStreamSlice(std.testing.allocator, raw));
+    }
 }
 
 test "writeGoJsonString escapes HTML and control chars like Go encoding/json" {
