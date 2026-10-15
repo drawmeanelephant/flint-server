@@ -103,6 +103,7 @@ pub fn main(init: std.process.Init) !u8 {
         var listen_addr: ?[]const u8 = null;
         var auth_key_path: ?[]const u8 = null;
         var allow_author_path: ?[]const u8 = null;
+        var read_timeout_sec: u32 = 60;
 
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
@@ -145,6 +146,21 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 i += 1;
                 allow_author_path = args[i];
+            } else if (std.mem.startsWith(u8, arg, "--read-timeout=")) {
+                read_timeout_sec = std.fmt.parseInt(u32, arg["--read-timeout=".len..], 10) catch {
+                    printRefusal(io, .usage, "invalid --read-timeout value");
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, arg, "--read-timeout")) {
+                if (i + 1 >= args.len) {
+                    printRefusal(io, .usage, "missing argument for --read-timeout");
+                    return 2;
+                }
+                i += 1;
+                read_timeout_sec = std.fmt.parseInt(u32, args[i], 10) catch {
+                    printRefusal(io, .usage, "invalid --read-timeout value");
+                    return 2;
+                };
             } else {
                 printRefusal(io, .usage, "unknown flag for serve");
                 return 2;
@@ -201,7 +217,11 @@ pub fn main(init: std.process.Init) !u8 {
             };
         } else {
             const bind_str = listen_addr orelse "127.0.0.1:4748";
-            serve.serveTcp(io, allocator, cfg, bind_str, null) catch {
+            const read_timeout: Io.Timeout = if (read_timeout_sec == 0)
+                .none
+            else
+                .{ .duration = .{ .raw = Io.Duration.fromSeconds(read_timeout_sec), .clock = .awake } };
+            serve.serveTcp(io, allocator, cfg, bind_str, null, read_timeout) catch {
                 printRefusal(io, .usage, "failed to listen on address");
                 return 1;
             };
