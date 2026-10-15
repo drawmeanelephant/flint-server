@@ -41,8 +41,11 @@ test -f "$STORE_DIR/streams/$STREAM_ID.jsonl"
 test "$(wc -l < "$STORE_DIR/streams/$STREAM_ID.jsonl")" -eq 2
 
 # 4. If companion flint client binary is available, run flint verify against the server store.
-FLINT_BIN="${FLINT_BIN:-$REPO_ROOT/../flint-client/zig-out/bin/flint}"
-if [[ -x "$FLINT_BIN" ]]; then
+if [[ -n "${FLINT_BIN:-}" ]]; then
+  if [[ ! -x "$FLINT_BIN" ]]; then
+    echo "FAIL: FLINT_BIN is not an executable client" >&2
+    exit 1
+  fi
   "$FLINT_BIN" verify --store="$STORE_DIR" --all
 fi
 

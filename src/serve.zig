@@ -3,12 +3,14 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const store = @import("store.zig");
 const proto = @import("proto.zig");
+const logging = @import("logging.zig");
 
 pub const ServeConfig = struct {
     root_path: []const u8,
     auth_key: ?[32]u8 = null,
     allow_authors: ?[]const [64]u8 = null,
     fixed_nonce: ?[16]u8 = null,
+    log_requests: bool = false,
 };
 
 /// Serves a single NDJSON session reading lines from `reader` and writing responses to `writer`.
@@ -25,6 +27,8 @@ pub fn serveStream(
         .allow_authors = cfg.allow_authors,
         .fixed_nonce = cfg.fixed_nonce,
     };
+    var connection: [16]u8 = undefined;
+    if (cfg.log_requests) io.random(&connection);
 
     var line_buf: Io.Writer.Allocating = .init(allocator);
     defer line_buf.deinit();
@@ -57,8 +61,22 @@ pub fn serveStream(
             break;
         }
 
-        try proto.handleLine(io, allocator, &session, line_buf.written(), writer);
+        proto.handleLine(io, allocator, &session, line_buf.written(), writer) catch |err| {
+            if (cfg.log_requests) logging.emit(io, .{
+                .connection = connection,
+                .seq = session.request_seq,
+                .operation = session.request_op,
+                .outcome = .io_error,
+            });
+            return err;
+        };
         try writer.flush();
+        if (cfg.log_requests) logging.emit(io, .{
+            .connection = connection,
+            .seq = session.request_seq,
+            .operation = session.request_op,
+            .outcome = .handled,
+        });
 
         if (session.close_after_reply or !got_delimiter) {
             break;

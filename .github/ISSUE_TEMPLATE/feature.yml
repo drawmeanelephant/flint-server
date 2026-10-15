@@ -1,0 +1,24 @@
+name: Feature or maintenance proposal
+description: Propose functionality or track technical debt.
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and impact
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed approach and compatibility
+      description: Include protocol/storage impact and alternatives.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: State the tests or measurements that prove completion.
+    validations:
+      required: true

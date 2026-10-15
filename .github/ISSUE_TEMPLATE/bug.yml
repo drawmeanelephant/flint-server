@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible flintd defect.
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Zig version, and flint-server commit.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal commands using a temporary store. Never attach secrets or private Change data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Tests and diagnostics
+      description: Relevant test failures or sanitized refusal codes.

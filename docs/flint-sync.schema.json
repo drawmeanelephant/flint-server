@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/drawmeanelephant/flint-server/docs/flint-sync.schema.json",
+  "title": "FLINT-SYNC/1 NDJSON messages",
+  "description": "One JSON object per line over TCP or stdio. This is not an HTTP API. See flint-server-spec.md for signing, commit ordering, auth, and error semantics.",
+  "oneOf": [
+    {"$ref": "#/$defs/request"},
+    {"$ref": "#/$defs/response"}
+  ],
+  "$defs": {
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "nullableUuid": {"anyOf": [{"$ref": "#/$defs/uuid"}, {"type": "null"}]},
+    "stream": {
+      "type": "object",
+      "required": ["id", "name", "created"],
+      "properties": {
+        "id": {"$ref": "#/$defs/uuid"},
+        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
+        "head": {"$ref": "#/$defs/nullableUuid"},
+        "created": {"type": "integer", "minimum": 0},
+        "forked_from": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "object", "required": ["stream", "change"], "properties": {"stream": {"$ref": "#/$defs/uuid"}, "change": {"$ref": "#/$defs/uuid"}}}
+          ]
+        }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "required": ["op"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0, "maximum": 4294967295, "default": 0}
+      }
+    },
+    "hello": {
+      "description": "Negotiate the protocol; returns a nonce when authentication is enabled.",
+      "type": "object",
+      "required": ["op", "proto"],
+      "properties": {"op": {"const": "hello"}, "proto": {"const": "FLINT-SYNC/1"}}
+    },
+    "auth": {
+      "description": "Authenticate after hello using the returned nonce and the domain-separated HMAC.",
+      "type": "object",
+      "required": ["op", "nonce", "hmac"],
+      "properties": {"op": {"const": "auth"}, "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "hmac": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "list": {
+      "description": "List stream records. This read-only operation is also used by the health probe.",
+      "type": "object",
+      "required": ["op"],
+      "properties": {"op": {"const": "list"}}
+    },
+    "heads": {
+      "description": "Return a canonical stream-ID to head map.",
+      "type": "object",
+      "required": ["op"],
+      "properties": {"op": {"const": "heads"}}
+    },
+    "open": {
+      "description": "Look up a stream by UUID or name using stream. The existing name alias is accepted only when stream is absent; stream takes precedence.",
+      "type": "object",
+      "required": ["op"],
+      "properties": {"op": {"const": "open"}},
+      "anyOf": [
+        {"required": ["stream"], "properties": {"stream": {"type": "string", "minLength": 1}}},
+        {"not": {"required": ["stream"]}, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}}}
+      ]
+    },
+    "read": {
+      "description": "Read raw signed Change lines after a cursor. Limits above 1024 are clamped.",
+      "type": "object",
+      "required": ["op", "stream"],
+      "properties": {"op": {"const": "read"}, "stream": {"$ref": "#/$defs/uuid"}, "after": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "limit": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}}
+    },
+    "create": {
+      "description": "Create a stream record; non-null heads must refer to a valid fork point.",
+      "type": "object",
+      "required": ["op", "record"],
+      "properties": {"op": {"const": "create"}, "record": {"$ref": "#/$defs/stream"}}
+    },
+    "append": {
+      "description": "Append a nonempty, fully verified batch. Change strings are raw JSONL bytes without the final newline.",
+      "type": "object",
+      "required": ["op", "stream", "changes"],
+      "properties": {"op": {"const": "append"}, "stream": {"type": "string", "minLength": 1}, "expected_head": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "changes": {"type": "array", "minItems": 1, "items": {"type": "string"}}}
+    },
+    "request": {
+      "allOf": [
+        {"$ref": "#/$defs/envelope"},
+        {"oneOf": [
+          {"$ref": "#/$defs/hello"}, {"$ref": "#/$defs/auth"},
+          {"$ref": "#/$defs/list"}, {"$ref": "#/$defs/heads"},
+          {"$ref": "#/$defs/open"}, {"$ref": "#/$defs/read"},
+          {"$ref": "#/$defs/create"}, {"$ref": "#/$defs/append"}
+        ]}
+      ]
+    },
+    "response": {
+      "type": "object",
+      "required": ["seq", "ok"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "ok": {"type": "boolean"},
+        "proto": {"const": "FLINT-SYNC/1"},
+        "server": {"const": "flintd"},
+        "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "streams": {"type": "array", "items": {"$ref": "#/$defs/stream"}},
+        "record": {"$ref": "#/$defs/stream"},
+        "heads": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nullableUuid"}},
+        "head": {"$ref": "#/$defs/nullableUuid"},
+        "changes": {"type": "array", "items": {"type": "string"}},
+        "more": {"type": "boolean"},
+        "refuse": {"type": "string", "enum": ["stream_missing", "stream_exists", "stale_head", "change_malformed", "change_missing", "sig_invalid", "store_too_large", "stream_malformed", "stream_torn", "message_invalid", "usage", "proto_version", "auth_required", "auth_failed", "author_not_allowed", "store_not_found", "store_missing"]},
+        "detail": {"type": "string"}
+      },
+      "if": {"properties": {"ok": {"const": false}}},
+      "then": {"required": ["refuse", "detail"]}
+    }
+  }
+}
