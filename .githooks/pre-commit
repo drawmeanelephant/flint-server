@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+snapshot="$(mktemp -d)"
+trap 'rm -rf "$snapshot"' EXIT
+cd "$root"
+git checkout-index --all --prefix="$snapshot/"
+cd "$snapshot"
+python3 tools/check.py --lint-only
+python3 -m unittest discover -s tools/tests

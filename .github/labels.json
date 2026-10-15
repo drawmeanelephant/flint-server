@@ -1,0 +1,15 @@
+[
+  {"name":"priority:critical","color":"B60205","description":"Immediate security, data-loss, or service-wide issue"},
+  {"name":"priority:high","color":"D93F0B","description":"Important current-release work"},
+  {"name":"priority:medium","color":"FBCA04","description":"Normal planned work"},
+  {"name":"priority:low","color":"0E8A16","description":"Optional or future work"},
+  {"name":"type:bug","color":"D73A4A","description":"Behavior is incorrect"},
+  {"name":"type:feature","color":"A2EEEF","description":"New functionality"},
+  {"name":"type:chore","color":"CFD3D7","description":"Tooling or maintenance"},
+  {"name":"type:debt","color":"D4C5F9","description":"Tracked technical debt with acceptance criteria"},
+  {"name":"area:protocol","color":"1D76DB","description":"FLINT-SYNC wire behavior"},
+  {"name":"area:store","color":"1D76DB","description":"Persistence and crash recovery"},
+  {"name":"area:auth","color":"1D76DB","description":"Authentication, signatures, and author policy"},
+  {"name":"area:tooling","color":"1D76DB","description":"Build, CI, tests, and developer tools"},
+  {"name":"area:docs","color":"1D76DB","description":"Documentation and schemas"}
+]

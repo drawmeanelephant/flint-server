@@ -5,6 +5,7 @@ const store = @import("store.zig");
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
 const auth = @import("auth.zig");
+const logging = @import("logging.zig");
 const RefusalCode = store.RefusalCode;
 const Stream = store.Stream;
 
@@ -17,6 +18,8 @@ pub const Session = struct {
     authed: bool = false,
     nonce: [16]u8 = undefined,
     close_after_reply: bool = false,
+    request_seq: ?u32 = null,
+    request_op: logging.Operation = .unknown,
 };
 
 pub fn writeRefusal(
@@ -44,6 +47,8 @@ pub fn handleLine(
     raw_line: []const u8,
     w: *Io.Writer,
 ) !void {
+    session.request_seq = null;
+    session.request_op = .unknown;
     const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
         raw_line[0 .. raw_line.len - 1]
     else
@@ -92,6 +97,7 @@ pub fn handleLine(
         }
     }
 
+    session.request_seq = @intCast(seq_val);
     const op_val = obj.get("op") orelse {
         try writeRefusal(w, seq_val, .usage, "missing op");
         return;
@@ -107,6 +113,7 @@ pub fn handleLine(
         try writeRefusal(w, seq_val, .usage, "missing op");
         return;
     }
+    session.request_op = std.meta.stringToEnum(logging.Operation, op_str) orelse .unknown;
 
     if (std.mem.eql(u8, op_str, "hello")) {
         try handleHello(io, session, obj, seq_val, w);

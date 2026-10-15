@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+hook="$(git rev-parse --git-path hooks)/pre-commit"
+if [[ -e "$hook" || -L "$hook" ]]; then
+  printf 'Refusing to replace existing hook: %s\n' "$hook" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$hook")"
+cp .githooks/pre-commit "$hook"
+chmod +x "$hook"
+printf 'Installed staged-snapshot pre-commit check at %s\n' "$hook"

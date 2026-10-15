@@ -580,3 +580,24 @@ test "M106c: bounded line reader refuses >4 MiB unterminated line with store_too
     );
 }
 
+test "request metadata resets on malformed input and never stores arbitrary operation strings" {
+    const allocator = std.testing.allocator;
+    var session = proto.Session{ .root_path = "unused" };
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try proto.handleLine(
+        std.testing.io,
+        allocator,
+        &session,
+        "{\"op\":\"private-client-content\",\"seq\":42}",
+        &output.writer,
+    );
+    try std.testing.expectEqual(@as(?u32, 42), session.request_seq);
+    try std.testing.expectEqual(.unknown, session.request_op);
+
+    output.clearRetainingCapacity();
+    try proto.handleLine(std.testing.io, allocator, &session, "not json", &output.writer);
+    try std.testing.expectEqual(@as(?u32, null), session.request_seq);
+    try std.testing.expectEqual(.unknown, session.request_op);
+}

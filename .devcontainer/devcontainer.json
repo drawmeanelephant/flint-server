@@ -1,0 +1,12 @@
+{
+  "name": "flint-server",
+  "build": {"dockerfile": "Dockerfile", "context": ".."},
+  "remoteUser": "developer",
+  "postCreateCommand": "zig version && python3 tools/check.py --lint-only",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ziglang.vscode-zig"],
+      "settings": {"editor.formatOnSave": true}
+    }
+  }
+}

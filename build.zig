@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    // Always execute tests, including CI stability runs with cached compilation.
+    run_exe_tests.has_side_effects = true;
 
     const test_step = b.step("test", "Run unit and conformance tests");
     test_step.dependOn(&run_exe_tests.step);

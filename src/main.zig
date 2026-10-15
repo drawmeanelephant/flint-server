@@ -239,6 +239,7 @@ pub fn main(init: std.process.Init) !u8 {
             .root_path = root_path,
             .auth_key = auth_key,
             .allow_authors = allow_authors,
+            .log_requests = true,
         };
 
         if (use_stdio) {
@@ -280,5 +281,6 @@ test {
     _ = auth;
     _ = proto;
     _ = serve;
+    _ = @import("logging.zig");
     _ = @import("conformance_test.zig");
 }
