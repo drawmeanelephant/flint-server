@@ -201,24 +201,27 @@ fn handleAuth(
         return;
     }
 
-    if (obj.get("nonce")) |nonce_val| {
-        const nonce_str = switch (nonce_val) {
-            .string => |s| s,
-            else => {
-                session.close_after_reply = true;
-                try writeRefusal(w, seq, .auth_failed, "invalid nonce");
-                return;
-            },
-        };
-        const expected_nonce_hex = store.encodeLowerHexFixed(16, session.nonce);
-        if (!std.mem.eql(u8, nonce_str, &expected_nonce_hex)) {
+    const nonce_val = obj.get("nonce") orelse {
+        session.close_after_reply = true;
+        try writeRefusal(w, seq, .auth_failed, "missing nonce");
+        return;
+    };
+    const nonce_str = switch (nonce_val) {
+        .string => |s| s,
+        else => {
             session.close_after_reply = true;
-            try writeRefusal(w, seq, .auth_failed, "nonce mismatch");
+            try writeRefusal(w, seq, .auth_failed, "invalid nonce");
             return;
-        }
+        },
+    };
+    const expected_nonce_hex = store.encodeLowerHexFixed(16, session.nonce);
+    if (!std.mem.eql(u8, nonce_str, &expected_nonce_hex)) {
+        session.close_after_reply = true;
+        try writeRefusal(w, seq, .auth_failed, "nonce mismatch");
+        return;
     }
 
-    const hmac_val = obj.get("hmac") orelse obj.get("mac") orelse {
+    const hmac_val = obj.get("hmac") orelse {
         session.close_after_reply = true;
         try writeRefusal(w, seq, .auth_failed, "missing hmac");
         return;
@@ -396,7 +399,7 @@ fn handleRead(
     };
     defer idx.deinit(allocator);
 
-    const found_st = idx.findByNameOrId(stream_arg) orelse {
+    const found_st = idx.findById(stream_arg) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
         return;
     };
@@ -418,9 +421,25 @@ fn handleRead(
             }
         }
         if (!matched) {
-            if (loaded.stream.forked_from != null and std.mem.eql(u8, loaded.stream.forked_from.?.change, after_id)) {
-                start_idx = 0;
-            } else {
+            if (loaded.stream.forked_from) |ff| {
+                const in_fork_chain = storeio.isChangeReachableInForkChain(
+                    io,
+                    allocator,
+                    session.root_path,
+                    ff.stream,
+                    after_id,
+                    ff.change,
+                    idx.streams.len + 1,
+                ) catch |err| {
+                    try writeStoreErrorRefusal(w, seq, err);
+                    return;
+                };
+                if (in_fork_chain) {
+                    start_idx = 0;
+                    matched = true;
+                }
+            }
+            if (!matched) {
                 try writeRefusal(w, seq, .change_missing, "after change not found in stream");
                 return;
             }

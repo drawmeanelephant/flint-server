@@ -345,36 +345,8 @@ pub fn encodeLowerHexFixed(comptime N: usize, bytes: [N]u8) [N * 2]u8 {
     return out;
 }
 
-pub fn formatUUIDv7(ms: u64, rand_bytes: [10]u8) [36]u8 {
-    var raw: [16]u8 = undefined;
-    raw[0] = @intCast((ms >> 40) & 0xff);
-    raw[1] = @intCast((ms >> 32) & 0xff);
-    raw[2] = @intCast((ms >> 24) & 0xff);
-    raw[3] = @intCast((ms >> 16) & 0xff);
-    raw[4] = @intCast((ms >> 8) & 0xff);
-    raw[5] = @intCast(ms & 0xff);
-    @memcpy(raw[6..16], &rand_bytes);
-    raw[6] = (raw[6] & 0x0f) | 0x70;
-    raw[8] = (raw[8] & 0x3f) | 0x80;
-
-    const hex_chars = "0123456789abcdef";
-    var out: [36]u8 = undefined;
-    var out_idx: usize = 0;
-    for (raw, 0..) |b, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[out_idx] = '-';
-            out_idx += 1;
-        }
-        out[out_idx] = hex_chars[b >> 4];
-        out[out_idx + 1] = hex_chars[b & 0x0f];
-        out_idx += 2;
-    }
-    return out;
-}
-
 test "validators and UUID parsing" {
-    const uuid = formatUUIDv7(1760000000000, .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 });
-    try std.testing.expect(isValidUUID(&uuid));
+    try std.testing.expect(isValidUUID("0199de2d-dc00-7000-8000-000000000001"));
     try std.testing.expect(!isValidUUID("0199DE2D-DC00-7000-8000-000000000001")); // uppercase
 
     try std.testing.expect(isValidStreamName("main"));

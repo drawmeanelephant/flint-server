@@ -310,7 +310,7 @@ pub fn loadStoreIndex(io: Io, allocator: Allocator, root_path: []const u8) Store
             total_changes += lines.len;
             if (total_changes > store.MaxChanges) return error.StoreTooLarge;
 
-            // Check if last line needs head roll-forward recovery.
+            // Check if last line needs head roll-forward recovery (including multi-change batches).
             if (lines.len > 0) {
                 var last_change = change.parseChange(allocator, lines[lines.len - 1]) catch |err| switch (err) {
                     error.ChangeMalformed, error.SigInvalid => return error.ChangeMalformed,
@@ -318,15 +318,17 @@ pub fn loadStoreIndex(io: Io, allocator: Allocator, root_path: []const u8) Store
                 };
                 defer last_change.deinit(allocator);
 
-                if (!optStrEql(st.head, last_change.id) and optStrEql(last_change.parent, st.head)) {
-                    const new_head = try allocator.dupe(u8, last_change.id);
+                if (!optStrEql(st.head, last_change.id)) {
+                    var recovered = try loadStream(io, allocator, root_path, stem);
+                    defer recovered.deinit(allocator);
+                    const new_head = if (recovered.stream.head) |h| try allocator.dupe(u8, h) else null;
                     if (st.head) |old_h| allocator.free(old_h);
                     st.head = new_head;
-                    const updated_bytes = try json.marshalStreamRecord(allocator, st);
-                    defer allocator.free(updated_bytes);
-                    try writeFileSafe(io, allocator, json_path, updated_bytes);
                 }
             }
+        } else {
+            const expected_empty_head: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
+            if (!optStrEql(st.head, expected_empty_head)) return error.StreamMalformed;
         }
 
         try streams.append(allocator, st);
@@ -441,13 +443,22 @@ pub fn loadStream(io: Io, allocator: Allocator, root_path: []const u8, stream_id
         try raw_lines_owned.append(allocator, try allocator.dupe(u8, line));
     }
 
+    const expected_first_parent: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
     if (changes.items.len == 0) {
-        const expected_empty_head: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
-        if (!optStrEql(st.head, expected_empty_head)) return error.StreamMalformed;
+        if (!optStrEql(st.head, expected_first_parent)) return error.StreamMalformed;
     } else {
         const last = changes.items[changes.items.len - 1];
         if (!optStrEql(st.head, last.id)) {
-            if (optStrEql(last.parent, st.head)) {
+            var can_roll_forward = optStrEql(st.head, expected_first_parent);
+            if (!can_roll_forward) {
+                for (changes.items[0 .. changes.items.len - 1]) |earlier| {
+                    if (optStrEql(st.head, earlier.id)) {
+                        can_roll_forward = true;
+                        break;
+                    }
+                }
+            }
+            if (can_roll_forward) {
                 const new_head = try allocator.dupe(u8, last.id);
                 if (st.head) |old_h| allocator.free(old_h);
                 st.head = new_head;
@@ -474,7 +485,70 @@ fn changeExistsInStream(loaded: *const LoadedStream, change_id: []const u8) bool
     return false;
 }
 
-/// Creates a new stream record and empty `.jsonl` log (`docs/flint-server-spec.md` §2.4).
+/// Checks whether `target_change_id` is reachable in `origin_stream_id`'s history,
+/// walking `forked_from` ancestry when `origin_stream_id` is itself a fork (§2.4).
+/// If `initial_cutoff` is non-null, only changes at or before `initial_cutoff` in
+/// `origin_stream_id` are considered reachable.
+pub fn isChangeReachableInForkChain(
+    io: Io,
+    allocator: Allocator,
+    root_path: []const u8,
+    origin_stream_id: []const u8,
+    target_change_id: []const u8,
+    initial_cutoff: ?[]const u8,
+    max_depth: usize,
+) StoreError!bool {
+    var curr_stream_id = try allocator.dupe(u8, origin_stream_id);
+    defer allocator.free(curr_stream_id);
+
+    var cutoff: ?[]u8 = if (initial_cutoff) |ic| try allocator.dupe(u8, ic) else null;
+    defer if (cutoff) |c| allocator.free(c);
+
+    var depth: usize = 0;
+    while (depth <= max_depth) : (depth += 1) {
+        var loaded = loadStream(io, allocator, root_path, curr_stream_id) catch |err| switch (err) {
+            error.StreamMissing => {
+                if (depth == 0) return error.StreamMissing;
+                return false;
+            },
+            else => return err,
+        };
+        defer loaded.deinit(allocator);
+
+        if (cutoff) |cut_id| {
+            var saw_cutoff = false;
+            for (loaded.changes) |c| {
+                if (std.mem.eql(u8, c.id, target_change_id)) return true;
+                if (std.mem.eql(u8, c.id, cut_id)) {
+                    saw_cutoff = true;
+                    break;
+                }
+            }
+            if (!saw_cutoff and loaded.stream.forked_from != null and std.mem.eql(u8, loaded.stream.forked_from.?.change, cut_id)) {
+                if (std.mem.eql(u8, cut_id, target_change_id)) return true;
+            }
+        } else {
+            if (optStrEql(loaded.stream.head, target_change_id)) return true;
+            if (changeExistsInStream(&loaded, target_change_id)) return true;
+        }
+
+        if (loaded.stream.forked_from) |ff| {
+            if (std.mem.eql(u8, ff.change, target_change_id)) return true;
+            const next_stream = try allocator.dupe(u8, ff.stream);
+            const next_cutoff = try allocator.dupe(u8, ff.change);
+            allocator.free(curr_stream_id);
+            curr_stream_id = next_stream;
+            if (cutoff) |old_c| allocator.free(old_c);
+            cutoff = next_cutoff;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// Creates a new stream record (`streams/<id>.json` only; `.jsonl` is created lazily on first `append`,
+/// per `docs/flint-server-spec.md` §2.4).
 pub fn createStream(
     io: Io,
     allocator: Allocator,
@@ -494,13 +568,16 @@ pub fn createStream(
 
     if (record.forked_from) |ff| {
         if (!optStrEql(record.head, ff.change)) return error.StreamMalformed;
-        var origin = loadStream(io, allocator, root_path, ff.stream) catch |err| switch (err) {
-            error.StreamMissing => return error.StreamMissing,
-            else => return err,
-        };
-        defer origin.deinit(allocator);
-
-        if (!changeExistsInStream(&origin, ff.change)) {
+        const reachable = try isChangeReachableInForkChain(
+            io,
+            allocator,
+            root_path,
+            ff.stream,
+            ff.change,
+            null,
+            idx.streams.len + 1,
+        );
+        if (!reachable) {
             return error.ChangeMissing;
         }
     } else {
@@ -510,11 +587,6 @@ pub fn createStream(
     const streams_dir_path = try std.fs.path.join(allocator, &.{ root_path, "streams" });
     defer allocator.free(streams_dir_path);
 
-    const jsonl_file = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{record.id});
-    defer allocator.free(jsonl_file);
-    const jsonl_path = try std.fs.path.join(allocator, &.{ streams_dir_path, jsonl_file });
-    defer allocator.free(jsonl_path);
-
     const json_file = try std.fmt.allocPrint(allocator, "{s}.json", .{record.id});
     defer allocator.free(json_file);
     const json_path = try std.fs.path.join(allocator, &.{ streams_dir_path, json_file });
@@ -523,7 +595,6 @@ pub fn createStream(
     const record_bytes = try json.marshalStreamRecord(allocator, record);
     defer allocator.free(record_bytes);
 
-    try writeFileSafe(io, allocator, jsonl_path, "");
     try writeFileSafe(io, allocator, json_path, record_bytes);
 }
 
@@ -548,32 +619,22 @@ pub fn appendStreamChanges(
     raw_lines: []const []const u8,
     allow_authors: ?[]const [64]u8,
 ) StoreError!?[]u8 {
-    // 1. Load store index to check store health and total change count.
+    // 1. Load store index and target stream (with roll-forward recovery).
     var idx = try loadStoreIndex(io, allocator, root_path);
     defer idx.deinit(allocator);
 
-    // 2. Load target stream.
     var loaded = try loadStream(io, allocator, root_path, stream_id);
     defer loaded.deinit(allocator);
 
-    // 3. Compare stream.head against expected_head.
+    // 2. Compare stream.head against expected_head. An empty batch is change_malformed (§2.3).
     if (!optStrEql(loaded.stream.head, expected_head)) {
         return error.StaleHead;
     }
-
-    // 4. Check store change bound.
-    if (idx.total_changes + raw_lines.len > store.MaxChanges) {
-        return error.StoreTooLarge;
-    }
-
     if (raw_lines.len == 0) {
-        if (loaded.stream.head) |h| {
-            return try allocator.dupe(u8, h);
-        }
-        return null;
+        return error.ChangeMalformed;
     }
 
-    // 5. Validate all incoming lines in order before touching disk.
+    // 3. Validate all incoming lines in exact §2.3 order before touching disk.
     var parsed_batch: std.ArrayList(Change) = .empty;
     defer {
         for (parsed_batch.items) |*c| c.deinit(allocator);
@@ -591,34 +652,42 @@ pub fn appendStreamChanges(
             return error.ChangeMalformed;
         }
 
+        // - ParseChange each raw line -> change_malformed
         var c = change.parseChange(allocator, trimmed) catch |err| switch (err) {
             error.ChangeMalformed, error.SigInvalid => return error.ChangeMalformed,
             error.OutOfMemory => return error.OutOfMemory,
         };
         errdefer c.deinit(allocator);
 
+        // - c.stream == S.id -> else change_malformed
         if (!std.mem.eql(u8, c.stream, stream_id)) return error.ChangeMalformed;
-        if (!optStrEql(c.parent, prev_head)) return error.ChangeMalformed;
+
+        // - Message <= 512 bytes valid UTF-8 (and non-empty) -> message_invalid
         if (!store.isValidMessage(c.message)) return error.MessageInvalid;
+
+        // - Parent chain: changes[0].parent == expected_head, and each subsequent parent equals previous Change's id -> else change_malformed
+        if (!optStrEql(c.parent, prev_head)) return error.ChangeMalformed;
 
         if (c.merged) |m| {
             if (!store.isValidUUID(m)) return error.ChangeMalformed;
         }
 
+        // - Reject duplicate change IDs in the stream or within this batch -> change_malformed
+        if (changeExistsInStream(&loaded, c.id)) return error.ChangeMalformed;
+        for (parsed_batch.items) |prev_c| {
+            if (std.mem.eql(u8, prev_c.id, c.id)) return error.ChangeMalformed;
+        }
+
+        // - VerifyChange each Change -> sig_invalid
         change.verifyChange(allocator, &c) catch |err| switch (err) {
             error.SigInvalid => return error.SigInvalid,
             error.ChangeMalformed => return error.ChangeMalformed,
             error.OutOfMemory => return error.OutOfMemory,
         };
 
+        // - Optional --allow-author gate -> author_not_allowed
         if (!isAuthorAllowed(c.author, allow_authors)) {
             return error.AuthorNotAllowed;
-        }
-
-        // Reject duplicate change IDs in the stream or within this batch.
-        if (changeExistsInStream(&loaded, c.id)) return error.ChangeMalformed;
-        for (parsed_batch.items) |prev_c| {
-            if (std.mem.eql(u8, prev_c.id, c.id)) return error.ChangeMalformed;
         }
 
         append_buf.writer.writeAll(trimmed) catch return error.OutOfMemory;
@@ -626,6 +695,11 @@ pub fn appendStreamChanges(
 
         try parsed_batch.append(allocator, c);
         prev_head = parsed_batch.items[parsed_batch.items.len - 1].id;
+    }
+
+    // - Total change count and 4 MiB store bounds after append -> store_too_large
+    if (idx.total_changes + raw_lines.len > store.MaxChanges) {
+        return error.StoreTooLarge;
     }
 
     const streams_dir_path = try std.fs.path.join(allocator, &.{ root_path, "streams" });
@@ -654,10 +728,10 @@ pub fn appendStreamChanges(
         return error.StoreTooLarge;
     }
 
-    // 6. Append verbatim raw lines to streams/<id>.jsonl + fsync.
+    // 4. Append verbatim raw lines to streams/<id>.jsonl + fsync.
     try appendSync(io, jsonl_path, append_buf.written());
 
-    // 7. Rewrite streams/<id>.json with head = last.id via writeFileSafe.
+    // 5. Rewrite streams/<id>.json with head = last.id via writeFileSafe.
     const new_head_str = parsed_batch.items[parsed_batch.items.len - 1].id;
     const new_head_copy = try allocator.dupe(u8, new_head_str);
     if (loaded.stream.head) |old_h| allocator.free(old_h);

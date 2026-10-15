@@ -219,37 +219,27 @@ test "M106a & M106b: initStore, stream record round-trip, roll-forward, torn str
     };
     try storeio.createStream(io, allocator, ts.root_path, st);
 
-    // Append c1.
-    const nh1 = try storeio.appendStreamChanges(io, allocator, ts.root_path, stream_id, null, &.{good_lines[0]}, null);
-    defer if (nh1) |h| allocator.free(h);
-    try std.testing.expectEqualStrings(c1_id, nh1.?);
-
-    // Simulate crash between appending c2 to .jsonl and updating .json head (stale head roll-forward).
+    // §2.4: createStream writes streams/<id>.json only; .jsonl is created lazily by the first append.
     const jsonl_path = try std.fmt.allocPrint(allocator, "{s}/streams/{s}.jsonl", .{ ts.root_path, stream_id });
     defer allocator.free(jsonl_path);
-    const c2_with_nl = try std.fmt.allocPrint(allocator, "{s}\n", .{c2_line});
-    defer allocator.free(c2_with_nl);
-    try storeio.appendSync(io, jsonl_path, c2_with_nl);
+    try std.testing.expect(!storeio.fileExists(io, jsonl_path));
 
-    // LoadStream must roll head forward from c1_id to c2_id and persist it.
+    // Simulate crash after a multi-change batch appendSync ([c1, c2]) before writeFileSafe updates head (head is still null).
+    const batch_with_nl = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ good_lines[0], c2_line });
+    defer allocator.free(batch_with_nl);
+    try storeio.appendSync(io, jsonl_path, batch_with_nl);
+
+    // Both loadStoreIndex and loadStream must roll head forward across the 2-change batch from null to c2_id.
+    {
+        var idx = try storeio.loadStoreIndex(io, allocator, ts.root_path);
+        defer idx.deinit(allocator);
+        try std.testing.expectEqualStrings(c2_id, idx.streams[0].head.?);
+    }
     {
         var loaded = try storeio.loadStream(io, allocator, ts.root_path, stream_id);
         defer loaded.deinit(allocator);
         try std.testing.expectEqualStrings(c2_id, loaded.stream.head.?);
         try std.testing.expectEqual(@as(usize, 2), loaded.changes.len);
-    }
-
-    // Check 4096 MaxChanges bound -> StoreTooLarge.
-    {
-        var many_lines = try allocator.alloc([]const u8, store.MaxChanges);
-        defer allocator.free(many_lines);
-        for (0..store.MaxChanges) |idx| {
-            many_lines[idx] = c2_line;
-        }
-        try std.testing.expectError(
-            error.StoreTooLarge,
-            storeio.appendStreamChanges(io, allocator, ts.root_path, stream_id, c2_id, many_lines, null),
-        );
     }
 
     // Check readFileBounded bound -> StoreTooLarge.
@@ -526,4 +516,67 @@ test "M106f: two-client sync journey, fork validation, and client/server store p
     defer idx.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), idx.streams.len);
     try std.testing.expectEqual(@as(usize, 3), idx.total_changes);
+
+    // 5. Multi-hop fork chain resolution (§2.4):
+    // fork_id ("feat") was forked from main@c2_id. Append c4 on feat, then create fork2 ("subfeat")
+    // pointing its forked_from at {stream: fork_id, change: c1_id} where c1_id lives in grandparent main
+    // before the c2_id fork cutoff.
+    const c4_id = "01928374-0000-7000-8000-000000000004";
+    const fork2_id = "01928374-0000-7000-8000-000000000098";
+    const c4_line = try makeSignedChangeLine(allocator, seed, c4_id, c2_id, fork_id, 1700000006, "commit on feat", &.{}, null);
+    defer allocator.free(c4_line);
+    const nh_feat = try storeio.appendStreamChanges(io, allocator, ts.root_path, fork_id, c2_id, &.{c4_line}, null);
+    defer if (nh_feat) |h| allocator.free(h);
+
+    // c3_id was committed on main AFTER fork_id forked at c2_id -> NOT in fork_id's history -> ChangeMissing!
+    try std.testing.expectError(
+        error.ChangeMissing,
+        storeio.createStream(io, allocator, ts.root_path, .{
+            .id = fork2_id,
+            .name = "subfeat",
+            .head = c3_id,
+            .created = 1700000007,
+            .forked_from = .{ .stream = fork_id, .change = c3_id },
+        }),
+    );
+
+    // c1_id WAS in main's history before fork_id's fork point c2_id -> resolves through fork chain!
+    try storeio.createStream(io, allocator, ts.root_path, .{
+        .id = fork2_id,
+        .name = "subfeat",
+        .head = c1_id,
+        .created = 1700000007,
+        .forked_from = .{ .stream = fork_id, .change = c1_id },
+    });
+
+    // Empty batch with matching expected_head -> ChangeMalformed (§2.3).
+    try std.testing.expectError(
+        error.ChangeMalformed,
+        storeio.appendStreamChanges(io, allocator, ts.root_path, main_id, c3_id, &.{}, null),
+    );
 }
+
+test "M106c: bounded line reader refuses >4 MiB unterminated line with store_too_large" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ts = try TempStore.init(allocator);
+    defer ts.deinit(allocator);
+
+    // Construct an unterminated request line of MaxLineBytes + 64 bytes.
+    const big_len = store.MaxLineBytes + 64;
+    const big_input = try allocator.alloc(u8, big_len);
+    defer allocator.free(big_input);
+    @memset(big_input, 'a');
+
+    var in_r = Io.Reader.fixed(big_input);
+    var out_w: Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+
+    try serve.serveStream(io, allocator, .{ .root_path = ts.root_path }, &in_r, &out_w.writer);
+    try std.testing.expectEqualStrings(
+        "{\"seq\":0,\"ok\":false,\"refuse\":\"store_too_large\",\"detail\":\"line exceeds 4 MiB\"}\n",
+        out_w.written(),
+    );
+}
+

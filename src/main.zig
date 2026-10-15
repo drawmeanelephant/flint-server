@@ -70,8 +70,6 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 i += 1;
                 flag_store = args[i];
-            } else if (!std.mem.startsWith(u8, arg, "-") and flag_store == null) {
-                flag_store = arg;
             } else {
                 printRefusal(io, .usage, "unknown flag for init");
                 return 2;
@@ -105,7 +103,6 @@ pub fn main(init: std.process.Init) !u8 {
         var listen_addr: ?[]const u8 = null;
         var auth_key_path: ?[]const u8 = null;
         var allow_author_path: ?[]const u8 = null;
-        var max_conns: ?usize = null;
 
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
@@ -148,11 +145,6 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 i += 1;
                 allow_author_path = args[i];
-            } else if (std.mem.startsWith(u8, arg, "--max-conns=")) {
-                max_conns = std.fmt.parseInt(usize, arg["--max-conns=".len..], 10) catch {
-                    printRefusal(io, .usage, "invalid --max-conns");
-                    return 2;
-                };
             } else {
                 printRefusal(io, .usage, "unknown flag for serve");
                 return 2;
@@ -209,7 +201,7 @@ pub fn main(init: std.process.Init) !u8 {
             };
         } else {
             const bind_str = listen_addr orelse "127.0.0.1:4748";
-            serve.serveTcp(io, allocator, cfg, bind_str, max_conns) catch {
+            serve.serveTcp(io, allocator, cfg, bind_str, null) catch {
                 printRefusal(io, .usage, "failed to listen on address");
                 return 1;
             };

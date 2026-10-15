@@ -32,17 +32,28 @@ pub fn serveStream(
     while (true) {
         line_buf.clearRetainingCapacity();
         var got_delimiter = true;
-        _ = reader.streamDelimiter(&line_buf.writer, '\n') catch |err| switch (err) {
-            error.EndOfStream => {
-                got_delimiter = false;
+        _ = reader.streamDelimiterLimit(&line_buf.writer, '\n', .limited(store.MaxLineBytes + 1)) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try proto.writeRefusal(writer, 0, .store_too_large, "line exceeds 4 MiB");
+                try writer.flush();
+                break;
             },
             error.ReadFailed => return error.ReadFailed,
             error.WriteFailed => return error.OutOfMemory,
         };
 
-        if (got_delimiter) {
-            reader.toss(1); // consume '\n'
-        } else if (line_buf.written().len == 0) {
+        if (reader.peekByte()) |b| {
+            if (b == '\n') {
+                reader.toss(1);
+            }
+        } else |err| switch (err) {
+            error.EndOfStream => {
+                got_delimiter = false;
+            },
+            error.ReadFailed => return error.ReadFailed,
+        }
+
+        if (!got_delimiter and line_buf.written().len == 0) {
             break;
         }
 

@@ -60,26 +60,10 @@ pub fn computeAuthHmac(key: [32]u8, nonce: [16]u8) [32]u8 {
     return out;
 }
 
-/// Computes `HMAC-SHA256(key, "FLINT-SYNC-AUTH/1\x00" || nonce_hex)` over the raw 32-byte key
-/// and 32-byte ASCII hex nonce (fallback compatibility if client hashes the hex string).
-pub fn computeAuthHmacAsciiNonce(key: [32]u8, nonce_hex: [32]u8) [32]u8 {
-    var h = HmacSha256.init(&key);
-    h.update(AuthDomainPrefix);
-    h.update(&nonce_hex);
-    var out: [32]u8 = undefined;
-    h.final(&out);
-    return out;
-}
-
 pub fn verifyAuthHmacHex(key: [32]u8, nonce: [16]u8, mac_hex: []const u8) bool {
     const provided = store.decodeLowerHexFixed(32, mac_hex) orelse return false;
     const expected_raw = computeAuthHmac(key, nonce);
-    if (std.crypto.timing_safe.eql([32]u8, provided, expected_raw)) {
-        return true;
-    }
-    const nonce_hex = store.encodeLowerHexFixed(16, nonce);
-    const expected_ascii = computeAuthHmacAsciiNonce(key, nonce_hex);
-    return std.crypto.timing_safe.eql([32]u8, provided, expected_ascii);
+    return std.crypto.timing_safe.eql([32]u8, provided, expected_raw);
 }
 
 test "HMAC-SHA256 challenge verification" {
