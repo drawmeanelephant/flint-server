@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# End-to-end sync journey: real flintd over TCP + the flint-client binary.
+# Mirrors docs/flint-server-spec.md §5 "Sync journey":
+#   A: init→commit→push; B: clone→edit→commit→push (stale_head until pull)
+#   →pull→merge→push; A pulls; all stores verify --all green.
+#
+# Legs that fail print "FAIL:" (contract violation, unexpected) or
+# "BUG:" (known-broken behavior we deliberately probe for). Any BUG line
+# means the journey passed the spec checks but found a spec violation.
+#
+# FLINT_BIN=/path/to/flint overrides the client binary location.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+zig build || exit 1
+FLINTD="$REPO_ROOT/zig-out/bin/flintd"
+FLINT="${FLINT_BIN:-$REPO_ROOT/../flint-client/zig-out/bin/flint}"
+if [[ ! -x "$FLINT" ]]; then
+  echo "e2e-journey: flint client binary not found at $FLINT" >&2
+  echo "build it (zig build) in flint-client, or set FLINT_BIN" >&2
+  exit 1
+fi
+
+TMP_DIR="$(mktemp -d)"
+SRV_PID=""
+cleanup() {
+  [[ -n "$SRV_PID" ]] && kill "$SRV_PID" 2>/dev/null
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+FAILS=0; BUGS=0
+fail() { echo "FAIL: $*" >&2; FAILS=$((FAILS+1)); }
+bug()  { echo "BUG:  $*" >&2; BUGS=$((BUGS+1)); }
+
+# --- server up (all fds redirected so it survives this script's subshell) ---
+
+SRV_STORE="$TMP_DIR/srv-store"
+init_out="$("$FLINTD" init --store="$SRV_STORE")"
+[[ "$init_out" == "flintd: init ok store=$SRV_STORE" ]] || fail "init: $init_out"
+
+"$FLINTD" serve --store="$SRV_STORE" --listen=127.0.0.1:0 >"$TMP_DIR/srv.out" 2>"$TMP_DIR/srv.err" &
+SRV_PID=$!
+for _ in $(seq 1 50); do
+  grep -q "flintd: listening" "$TMP_DIR/srv.err" 2>/dev/null && break
+  sleep 0.1
+done
+LISTEN="$(grep 'flintd: listening' "$TMP_DIR/srv.err" | awk '{print $3}')"
+[[ -n "$LISTEN" ]] || { cat "$TMP_DIR/srv.err" >&2; exit 1; }
+REMOTE="tcp://$LISTEN"
+echo "server: $REMOTE"
+
+flint_in() { # flint_in <dir> <args...>
+  local d="$1"; shift
+  (cd "$d" && FLINT_STORE="$d/store" "$FLINT" "$@")
+}
+
+# --- leg 1: A init/commit/push; B clone --------------------------------------
+
+A="$TMP_DIR/a"; mkdir -p "$A/src"
+cat > "$A/src/calc.go" <<'EOF'
+package calc
+
+func X() int {
+	return 1
+}
+EOF
+flint_in "$A" keygen --name=a >/dev/null
+out="$(flint_in "$A" init --name=wa --src="$A/src")"
+[[ "$out" == "flint: init ok ws=wa stream=main" ]] || fail "A init: $out"
+flint_in "$A" add --ws=wa >/dev/null
+out="$(flint_in "$A" commit -m=a1 --key=a --ws=wa)"
+echo "A commit:  $out"
+out="$(flint_in "$A" push --remote="$REMOTE" --ws=wa)"
+echo "A push:    $out"
+[[ "$out" == "flint: push ok stream=main changes=1" ]] || fail "A push: $out"
+
+B="$TMP_DIR/b"; mkdir -p "$B/src"
+flint_in "$B" keygen --name=b >/dev/null
+out="$(flint_in "$B" clone "$REMOTE" --stream=main --name=wb --src="$B/src")"
+echo "B clone:   $out"
+[[ "$out" == "flint: clone ok stream=main changes=1" ]] || fail "B clone: $out"
+
+# --- leg 2: A pushes ahead; B fast-forwards via pull --------------------------
+
+cat > "$A/src/extra.go" <<'EOF'
+package calc
+
+func Z() int {
+	return 3
+}
+EOF
+flint_in "$A" add --ws=wa >/dev/null
+flint_in "$A" commit -m=a2 --key=a --ws=wa >/dev/null
+out="$(flint_in "$A" push --ws=wa)"   # remote resolved from ws/wa/REMOTE.json
+echo "A push:    $out"
+[[ "$out" == "flint: push ok stream=main changes=1" ]] || fail "A push2: $out"
+
+out="$(flint_in "$B" pull --ws=wb)"   # B has no divergence: remote is strictly ahead
+echo "B pull:    $out"
+[[ "$out" == "flint: pull ok stream=main changes=1" ]] || fail "B pull: $out"
+
+# B commits on top and pushes back; A pulls it.
+cat > "$B/src/calc.go" <<'EOF'
+package calc
+
+func X() int {
+	return 10
+}
+EOF
+flint_in "$B" add --ws=wb >/dev/null
+flint_in "$B" commit -m=b1 --key=b --ws=wb >/dev/null
+out="$(flint_in "$B" push --ws=wb)"
+echo "B push:    $out"
+[[ "$out" == "flint: push ok stream=main changes=1" ]] || fail "B push: $out"
+out="$(flint_in "$A" pull --ws=wa)"
+echo "A pull:    $out"
+[[ "$out" == "flint: pull ok stream=main changes=1" ]] || fail "A pull: $out"
+
+# --- leg 3: divergence refusals ------------------------------------------------
+# A pushes a3 while C holds a divergent local commit on the same base.
+
+C="$TMP_DIR/c"; mkdir -p "$C/src"
+flint_in "$C" keygen --name=c >/dev/null
+out="$(flint_in "$C" clone "$REMOTE" --stream=main --name=wc --src="$C/src")"
+echo "C clone:   $out"
+
+cat > "$A/src/more.go" <<'EOF'
+package calc
+
+func W() int {
+	return 4
+}
+EOF
+flint_in "$A" add --ws=wa >/dev/null
+flint_in "$A" commit -m=a3 --key=a --ws=wa >/dev/null
+flint_in "$A" push --ws=wa >/dev/null
+
+cat > "$C/src/calc.go" <<'EOF'
+package calc
+
+func X() int {
+	return 99
+}
+EOF
+flint_in "$C" add --ws=wc >/dev/null
+out="$(flint_in "$C" commit -m=c1 --key=c --ws=wc)"
+echo "C commit:  $out"
+C1_ID="$(sed -n 's/.*id=\([0-9a-f-]*\).*/\1/p' <<<"$out")"
+[[ -n "$C1_ID" ]] || fail "could not parse C commit id"
+
+out="$(flint_in "$C" push --ws=wc)" && fail "C push expected stale_head, got: $out"
+echo "C push:    $out"
+[[ "$out" == "flint: refuse stale_head" ]] || fail "C push refusal: $out"
+
+out="$(flint_in "$C" pull --ws=wc)" && fail "C pull expected fork_needed, got: $out"
+echo "C pull:    $out"
+[[ "$out" == "flint: refuse fork_needed" ]] || fail "C pull refusal: $out"
+
+# --- leg 4: recovery probes (known-broken in flint-client today) --------------
+# Spec §4: "the client resolves divergence with fork/merge, never silent
+# overwrite." Today no verb sequence achieves that; each probe documents a
+# gap so this suite flips green as the client lands fixes.
+
+# 4a. fork the divergent head aside, push the side stream. Pushing a fork
+#     whose fork-point is an unpushed divergent change must surface a
+#     refusal (it does: stale_head via the ancestor push) — but the refusal
+#     must name the real problem, and the stream must not half-create.
+out="$(flint_in "$C" fork main c-work)"
+[[ "$out" == "flint: fork ok stream=c-work head="* ]] || fail "C fork: $out"
+out="$(flint_in "$C" push --stream=c-work --remote="$REMOTE")" && \
+  bug "push c-work succeeded although fork point c1 is unpushed divergent history"
+echo "C push c-work: $out"
+# Server must not hold a half-created c-work.
+if grep -q '"c-work"' "$SRV_STORE"/streams/*.json 2>/dev/null; then
+  bug "server holds partial c-work record after failed push"
+fi
+
+# 4b. re-clone of an existing stream must NOT silently overwrite local
+#     history (spec: "never silent overwrite"). Correct behavior is a
+#     refusal (stream_exists / fork_needed). Today it rewrites the stream
+#     record and truncates the .jsonl, destroying local changes.
+mkdir -p "$C/src2"
+out="$(flint_in "$C" clone "$REMOTE" --stream=main --name=wc2 --src="$C/src2")" && {
+  # clone succeeded — did it preserve C's divergent change in main's log?
+  C_MAIN_REC="$(grep -l '"name":"main"' "$C/store/streams/"*.json | head -1)"
+  C_MAIN_LOG="${C_MAIN_REC%.json}.jsonl"
+  if grep -q "$C1_ID" "$C_MAIN_LOG" 2>/dev/null; then
+    bug "re-clone kept the log but still overwrote the local stream head"
+  else
+    bug "re-clone silently overwrote local stream: divergent change destroyed"
+  fi
+} || {
+  echo "C re-clone refused (correct): $out"
+}
+
+# --- leg 5: verify everywhere ------------------------------------------------
+
+for who in A B C; do
+  d="${!who}"
+  out="$(flint_in "$d" verify --all 2>&1)" && echo "$who verify:  ok" \
+    || fail "$who verify: $out"
+done
+out="$(flint_in "$TMP_DIR" verify --all --store="$SRV_STORE" 2>&1)" \
+  && echo "SRV verify: ok" || fail "SRV verify: $out"
+
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+echo
+if [[ $FAILS -gt 0 ]]; then
+  echo "e2e-journey: $FAILS contract failure(s), $BUGS known bug(s)"; exit 1
+elif [[ $BUGS -gt 0 ]]; then
+  echo "e2e-journey: spec legs pass, $BUGS known bug(s) surfaced"; exit 0
+else
+  echo "e2e-journey: ok"; exit 0
+fi

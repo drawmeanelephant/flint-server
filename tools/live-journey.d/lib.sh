@@ -135,9 +135,9 @@ EOF
 lj_set_atom() { # lj_set_atom <dir> <alpha|beta> <value>
   local f="$1/main.zig" other
   case "$2" in
-    alpha) other="pub const beta: u32 = $(grep -oP 'beta: u32 = \K[0-9]+' "$f");";
+    alpha) other="pub const beta: u32 = $(sed -n 's/.*beta: u32 = \([0-9][0-9]*\);.*/\1/p' "$f");";
            printf 'pub const alpha: u32 = %s;\n%s\n' "$3" "$other" >"$f" ;;
-    beta)  other="pub const alpha: u32 = $(grep -oP 'alpha: u32 = \K[0-9]+' "$f");";
+    beta)  other="pub const alpha: u32 = $(sed -n 's/.*alpha: u32 = \([0-9][0-9]*\);.*/\1/p' "$f");";
            printf '%s\npub const beta: u32 = %s;\n' "$other" "$3" >"$f" ;;
   esac
 }
