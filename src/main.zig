@@ -278,6 +278,7 @@ test {
     _ = change;
     _ = jsonl;
     _ = storeio;
+    _ = @import("indexcache.zig");
     _ = auth;
     _ = proto;
     _ = serve;

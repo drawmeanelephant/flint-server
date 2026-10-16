@@ -4,6 +4,7 @@ const Io = std.Io;
 const store = @import("store.zig");
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
+const indexcache = @import("indexcache.zig");
 const auth = @import("auth.zig");
 const logging = @import("logging.zig");
 const RefusalCode = store.RefusalCode;
@@ -25,6 +26,10 @@ pub const Session = struct {
     close_after_reply: bool = false,
     request_seq: ?u32 = null,
     request_op: logging.Operation = .unknown,
+    /// Shared store-index cache (issue #46). Owned by the caller; when null,
+    /// ops that need the index fall back to a fresh `loadStoreIndex` per
+    /// request line, exactly as before caching existed.
+    index_cache: ?*indexcache.StoreIndexCache = null,
 };
 
 pub fn writeRefusal(
@@ -138,18 +143,25 @@ pub fn handleLine(
         return;
     }
 
+    // Ops dispatched below may consult the store index. Without a shared
+    // cache (bare Session in tests) each line reloads it, matching the
+    // pre-cache behavior exactly.
+    var scratch_cache: indexcache.StoreIndexCache = .{};
+    defer scratch_cache.deinit(allocator);
+    const index_cache = session.index_cache orelse &scratch_cache;
+
     if (std.mem.eql(u8, op_str, "list")) {
-        try handleList(io, allocator, session, seq_val, w);
+        try handleList(io, allocator, session, index_cache, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "heads")) {
-        try handleHeads(io, allocator, session, seq_val, w);
+        try handleHeads(io, allocator, session, index_cache, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "open")) {
-        try handleOpen(io, allocator, session, obj, seq_val, w);
+        try handleOpen(io, allocator, session, index_cache, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "read")) {
-        try handleRead(io, allocator, session, obj, seq_val, w);
+        try handleRead(io, allocator, session, index_cache, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "create")) {
-        try handleCreate(io, allocator, session, obj, seq_val, w);
+        try handleCreate(io, allocator, session, index_cache, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "append")) {
-        try handleAppend(io, allocator, session, obj, seq_val, w);
+        try handleAppend(io, allocator, session, index_cache, obj, seq_val, w);
     } else {
         try writeRefusal(w, seq_val, .usage, "unknown op");
     }
@@ -264,14 +276,14 @@ fn handleList(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     seq: u64,
     w: *Io.Writer,
 ) Io.Writer.Error!void {
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    const idx = index_cache.get(io, allocator, session.root_path) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     try w.print("{{\"seq\":{d},\"ok\":true,\"streams\":[", .{seq});
     for (idx.streams, 0..) |st, i| {
@@ -281,7 +293,7 @@ fn handleList(
     try w.writeAll("]}\n");
 }
 
-fn streamByIdLessThan(_: void, a: Stream, b: Stream) bool {
+fn streamPtrByIdLessThan(_: void, a: *const Stream, b: *const Stream) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
@@ -289,20 +301,24 @@ fn handleHeads(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     seq: u64,
     w: *Io.Writer,
 ) Io.Writer.Error!void {
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    const idx = index_cache.get(io, allocator, session.root_path) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
-    // Sort by stream id so the JSON object keys are emitted in canonical order.
-    std.mem.sort(Stream, idx.streams, {}, streamByIdLessThan);
+    // Sort a copy of the streams by id so the JSON object keys are emitted in
+    // canonical order without disturbing the cached index's name ordering.
+    const ordered = allocator.alloc(*const Stream, idx.streams.len) catch return error.WriteFailed;
+    defer allocator.free(ordered);
+    for (idx.streams, 0..) |*st, i| ordered[i] = st;
+    std.mem.sort(*const Stream, ordered, {}, streamPtrByIdLessThan);
 
     try w.print("{{\"seq\":{d},\"ok\":true,\"heads\":{{", .{seq});
-    for (idx.streams, 0..) |st, i| {
+    for (ordered, 0..) |st, i| {
         if (i > 0) try w.writeByte(',');
         try json.writeGoJsonString(w, st.id);
         try w.writeByte(':');
@@ -315,6 +331,7 @@ fn handleOpen(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -335,11 +352,10 @@ fn handleOpen(
         return;
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    const idx = index_cache.get(io, allocator, session.root_path) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found = idx.findByNameOrId(req_stream) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
@@ -355,6 +371,7 @@ fn handleRead(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -408,11 +425,10 @@ fn handleRead(
         }
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    const idx = index_cache.get(io, allocator, session.root_path) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found_st = idx.findById(stream_arg) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
@@ -481,6 +497,7 @@ fn handleCreate(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -503,7 +520,11 @@ fn handleCreate(
     };
     defer record.deinit(allocator);
 
-    storeio.createStream(io, allocator, session.root_path, record) catch |err| {
+    // A failed create may still have touched the store, so the index cache is
+    // dropped after every attempt, not only on success.
+    const create_result = storeio.createStream(io, allocator, session.root_path, record);
+    index_cache.invalidate(allocator);
+    create_result catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
@@ -515,6 +536,7 @@ fn handleAppend(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -574,7 +596,7 @@ fn handleAppend(
         }
     }
 
-    const new_head = storeio.appendStreamChanges(
+    const append_result = storeio.appendStreamChanges(
         io,
         allocator,
         session.root_path,
@@ -582,7 +604,12 @@ fn handleAppend(
         expected_head,
         raw_lines,
         session.allow_authors,
-    ) catch |err| {
+    );
+    // A failed append may still have touched the store (e.g. the .jsonl
+    // append fsynced but the .json rewrite refused), so drop the index cache
+    // after every attempt.
+    index_cache.invalidate(allocator);
+    const new_head = append_result catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
