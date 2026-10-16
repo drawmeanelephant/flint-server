@@ -756,7 +756,9 @@ test "read-only streams dir: writes fail IoFailure and map to store_io" {
 
     const streams_dir = try std.fs.path.join(allocator, &.{ root_path, "streams" });
     defer allocator.free(streams_dir);
-    var dir = try Io.Dir.cwd().openDir(io, streams_dir, .{});
+    // `.iterate = true`: on Linux `openDir` without it yields an O_PATH
+    // descriptor, and `setPermissions` (fchmod) on O_PATH fails EBADF.
+    var dir = try Io.Dir.cwd().openDir(io, streams_dir, .{ .iterate = true });
     defer dir.close(io);
     try dir.setPermissions(io, .fromMode(0o555));
     defer dir.setPermissions(io, .fromMode(0o755)) catch {};
