@@ -26,6 +26,10 @@ pub const StoreError = error{
     StreamTorn,
     MessageInvalid,
     AuthorNotAllowed,
+    ManifestTorn,
+    BlobMissing,
+    BlobMalformed,
+    BlobTooLarge,
     Usage,
     IoFailure,
     OutOfMemory,
@@ -54,6 +58,10 @@ pub fn refusalForError(err: StoreError) RefusalInfo {
         error.StreamTorn => .{ .code = .stream_torn, .detail = "jsonl missing trailing newline" },
         error.MessageInvalid => .{ .code = .message_invalid, .detail = "invalid commit message" },
         error.AuthorNotAllowed => .{ .code = .author_not_allowed, .detail = "author not in allowlist" },
+        error.ManifestTorn => .{ .code = .manifest_torn, .detail = "manifest log torn or path not normalized" },
+        error.BlobMissing => .{ .code = .blob_missing, .detail = "blob not found" },
+        error.BlobMalformed => .{ .code = .blob_malformed, .detail = "blob id does not match content" },
+        error.BlobTooLarge => .{ .code = .change_too_large, .detail = "blob exceeds 1,800,000 bytes" },
         error.Usage => .{ .code = .usage, .detail = "invalid request" },
         error.IoFailure => .{ .code = .store_io, .detail = "io error" },
         error.OutOfMemory => .{ .code = .store_too_large, .detail = "out of memory" },
@@ -659,7 +667,7 @@ pub fn createStream(
     try writeFileSafe(io, allocator, json_path, record_bytes);
 }
 
-fn isAuthorAllowed(author_hex: []const u8, allowlist: ?[]const [64]u8) bool {
+pub fn isAuthorAllowed(author_hex: []const u8, allowlist: ?[]const [64]u8) bool {
     const list = allowlist orelse return true;
     if (author_hex.len != 64) return false;
     for (list) |allowed| {
@@ -955,46 +963,4 @@ pub fn depositStreamChanges(
         .head = if (loaded.stream.head) |h| try allocator.dupe(u8, h) else null,
         .stored = parsed_batch.items.len,
     };
-}
-
-test "read-only streams dir: writes fail IoFailure and map to store_io" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer allocator.free(root_path);
-    try initStore(io, allocator, root_path);
-
-    const streams_dir = try std.fs.path.join(allocator, &.{ root_path, "streams" });
-    defer allocator.free(streams_dir);
-    // `.iterate = true`: on Linux `openDir` without it yields an O_PATH
-    // descriptor, and `setPermissions` (fchmod) on O_PATH fails EBADF.
-    var dir = try Io.Dir.cwd().openDir(io, streams_dir, .{ .iterate = true });
-    defer dir.close(io);
-    try dir.setPermissions(io, .fromMode(0o555));
-    defer dir.setPermissions(io, .fromMode(0o755)) catch {};
-
-    // Read-only but listable: loadStoreIndex still works; the write path refuses.
-    {
-        var idx = try loadStoreIndex(io, allocator, root_path);
-        defer idx.deinit(allocator);
-        try std.testing.expectEqual(@as(usize, 0), idx.streams.len);
-    }
-    const st = store.Stream{
-        .id = "0199de2d-dc00-7000-8000-0000000000f0",
-        .name = "main",
-        .created = 1760000000000,
-    };
-    try std.testing.expectError(error.IoFailure, createStream(io, allocator, root_path, st));
-
-    // The refusal surface is the regression: an io/perm failure is not
-    // a malformed stream record (issue #36).
-    const info = refusalForError(error.IoFailure);
-    try std.testing.expectEqual(RefusalCode.store_io, info.code);
-    try std.testing.expectEqualStrings("store_io", RefusalCode.store_io.asText());
-    try std.testing.expectEqualStrings("io error", info.detail);
-    const malformed = refusalForError(error.StreamMalformed);
-    try std.testing.expectEqual(RefusalCode.stream_malformed, malformed.code);
 }

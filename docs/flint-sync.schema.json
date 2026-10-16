@@ -91,6 +91,30 @@
       "required": ["op", "stream", "changes"],
       "properties": {"op": {"const": "deposit"}, "stream": {"type": "string", "minLength": 1}, "changes": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}}}
     },
+    "put_manifest": {
+      "description": "Append signed manifest lines to a stream's manifest log; 1-256 per request, idempotent by bound Change id. Lines are raw JSONL bytes without the final newline.",
+      "type": "object",
+      "required": ["op", "stream", "lines"],
+      "properties": {"op": {"const": "put_manifest"}, "stream": {"type": "string", "minLength": 1}, "lines": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}}}
+    },
+    "get_manifest": {
+      "description": "Read raw signed manifest lines whose bound change is after the cursor, mirroring read's after. A null after returns the whole manifest log.",
+      "type": "object",
+      "required": ["op", "stream"],
+      "properties": {"op": {"const": "get_manifest"}, "stream": {"$ref": "#/$defs/uuid"}, "after": {"anyOf": [{"type": "string"}, {"type": "null"}]}}
+    },
+    "blob_put": {
+      "description": "Store a content-addressed blob; id is the lowercase-hex SHA-256 of the decoded hex bytes (decoded size at most 1,800,000 bytes). Idempotent.",
+      "type": "object",
+      "required": ["op", "id", "hex"],
+      "properties": {"op": {"const": "blob_put"}, "id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "hex": {"type": "string", "pattern": "^([0-9a-f]{2})*$"}}
+    },
+    "blob_get": {
+      "description": "Fetch a blob by id; the stored bytes are returned as lowercase hex.",
+      "type": "object",
+      "required": ["op", "id"],
+      "properties": {"op": {"const": "blob_get"}, "id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
     "request": {
       "allOf": [
         {"$ref": "#/$defs/envelope"},
@@ -99,7 +123,9 @@
           {"$ref": "#/$defs/list"}, {"$ref": "#/$defs/heads"},
           {"$ref": "#/$defs/open"}, {"$ref": "#/$defs/read"},
           {"$ref": "#/$defs/create"}, {"$ref": "#/$defs/append"},
-          {"$ref": "#/$defs/deposit"}
+          {"$ref": "#/$defs/deposit"}, {"$ref": "#/$defs/put_manifest"},
+          {"$ref": "#/$defs/get_manifest"}, {"$ref": "#/$defs/blob_put"},
+          {"$ref": "#/$defs/blob_get"}
         ]}
       ]
     },
@@ -118,9 +144,11 @@
         "heads": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nullableUuid"}},
         "head": {"$ref": "#/$defs/nullableUuid"},
         "changes": {"type": "array", "items": {"type": "string"}},
+        "lines": {"type": "array", "items": {"type": "string"}},
+        "hex": {"type": "string", "pattern": "^([0-9a-f]{2})*$"},
         "stored": {"type": "integer", "minimum": 0},
         "more": {"type": "boolean"},
-        "refuse": {"type": "string", "enum": ["stream_missing", "stream_exists", "stale_head", "change_malformed", "change_missing", "sig_invalid", "store_too_large", "stream_malformed", "stream_torn", "message_invalid", "usage", "proto_version", "auth_required", "auth_failed", "author_not_allowed", "store_not_found", "store_missing", "store_io"]},
+        "refuse": {"type": "string", "enum": ["stream_missing", "stream_exists", "stale_head", "change_malformed", "change_missing", "sig_invalid", "store_too_large", "stream_malformed", "stream_torn", "message_invalid", "usage", "proto_version", "auth_required", "auth_failed", "author_not_allowed", "store_not_found", "store_missing", "store_io", "manifest_torn", "blob_missing", "blob_malformed", "change_too_large"]},
         "detail": {"type": "string"}
       },
       "if": {"properties": {"ok": {"const": false}}},

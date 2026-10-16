@@ -23,13 +23,17 @@ Omitting it currently defaults to zero; clients should always send it.
 | `create` | `op`, `record` | Create a stream record; non-null heads must refer to a valid fork point. |
 | `append` | `op`, `stream`, `changes` | Append a nonempty, fully verified batch. Change strings are raw JSONL bytes without the final newline. |
 | `deposit` | `op`, `stream`, `changes` | Append detached signed Change lines without moving the head; 1-256 per request, idempotent by Change id. Change strings are raw JSONL bytes without the final newline. |
+| `put_manifest` | `op`, `stream`, `lines` | Append signed manifest lines to a stream's manifest log; 1-256 per request, idempotent by bound Change id. Lines are raw JSONL bytes without the final newline. |
+| `get_manifest` | `op`, `stream` | Read raw signed manifest lines whose bound change is after the cursor, mirroring read's after. A null after returns the whole manifest log. |
+| `blob_put` | `op`, `id`, `hex` | Store a content-addressed blob; id is the lowercase-hex SHA-256 of the decoded hex bytes (decoded size at most 1,800,000 bytes). Idempotent. |
+| `blob_get` | `op`, `id` | Fetch a blob by id; the stored bytes are returned as lowercase hex. |
 
 ## Responses
 
 Every reply includes `seq` and `ok`. Refusals additionally include
 `refuse` and `detail`. Success payloads depend on the operation.
 
-Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `store_not_found`, `store_missing`, `store_io`.
+Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `store_not_found`, `store_missing`, `store_io`, `manifest_torn`, `blob_missing`, `blob_malformed`, `change_too_large`.
 
 One session has one request in flight. Lines are bounded to 4 MiB.
 There are at most 4096 changes per stream. `read` defaults to 256
