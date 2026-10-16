@@ -3,7 +3,7 @@ const Io = std.Io;
 const store = @import("store.zig");
 
 // Values are a closed allowlist, never arbitrary client strings.
-pub const Operation = enum { unknown, hello, auth, list, heads, open, read, create, append };
+pub const Operation = enum { unknown, hello, auth, list, heads, open, read, create, append, deposit, put_manifest, get_manifest, blob_put, blob_get };
 pub const Outcome = enum { handled, io_error };
 
 pub const Request = struct {

@@ -26,6 +26,25 @@ PROTO = "FLINT-SYNC/1"
 STREAM = "0199de2d-dc00-7000-8000-000000000010"
 RESULTS = []
 
+# Signed Changes on STREAM for the deposit checks (spec_rev 3, issue #40):
+# DETACHED roots at the first pinned change, DETACHED_CHILD roots at DETACHED,
+# EXTENDS_HEAD parents the head the pinned append batch produces, and ORPHAN
+# names an id nobody holds. All verify under the pinned vector key.
+DETACHED = '{"id":"0199de2d-dc00-7000-8000-000000000102","parent":"0199de2d-dc00-7000-8000-000000000100","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000002000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"preserved recovery original","ops":[],"merged":null,"sig":"0576aa4b885bc6bb20bd26a6cacbf686a7f2914bd9ebd637af8527f0d463dc620187624effdc3eebe1393e94e1186aa54d8934e5d60437322dcced51886fe20f"}'
+EXTENDS_HEAD = '{"id":"0199de2d-dc00-7000-8000-000000000103","parent":"0199de2d-dc00-7000-8000-000000000101","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000003000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"looks like an append","ops":[],"merged":null,"sig":"e1126add21199e066fcd29cfc857f5a69c56913321b4415ea9a6a2b31cdc5abaffdf664f8fd140fea818b36cf5c313f80b36cdd55623aa09e8bf8780abf3dd0c"}'
+ORPHAN = '{"id":"0199de2d-dc00-7000-8000-000000000104","parent":"0199de2d-dc00-7000-8000-00000000ffff","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000004000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"orphan parent","ops":[],"merged":null,"sig":"319e99a18317a0f22d5a1906832a7e7c4f8d5df13e6855448e13d4320de5a721a353d8a4622c6aa8501b247e82ca8cf18748f2eb2b4a5371edd68b7268810e04"}'
+DETACHED_CHILD = '{"id":"0199de2d-dc00-7000-8000-000000000105","parent":"0199de2d-dc00-7000-8000-000000000102","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000005000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"child of detached","ops":[],"merged":null,"sig":"5a864337aa1f288c43909d4b2fc1df9e1fd5e4ab2fc4a8132b885c49f9c8980c827b82aaeef987b02592155ffc6fbd6e7dcc8daa3835fcf9755a4271f8f07603"}'
+
+# Signed manifest lines for the spec_rev 4 content checks (issue #43):
+# signed with the same pinned key over the "flint-manifest-v1" domain for
+# changes the shared store holds (append head chain and the deposited
+# detached line) plus one for a change nobody holds.
+MANIFEST_C1 = '{"stream":"0199de2d-dc00-7000-8000-000000000010","change":"0199de2d-dc00-7000-8000-000000000100","author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","files":[{"path":"go/sample.go","blob":"b7ead51daa2b6803b293b2518b882feb3ac4f1af03799375683b821306ed7eb7","bytes":54,"mode":644}],"sig":"bc383d0d0886b6b3b437c10e6775a73ce729d54c42755168130b0d1cb53e5981a4534223946a739cf3bc67e3f656dd3f28d07543818529807d0cfbe98a71970b"}'
+MANIFEST_DET = '{"stream":"0199de2d-dc00-7000-8000-000000000010","change":"0199de2d-dc00-7000-8000-000000000102","author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","files":[{"path":"go/sample.go","blob":"b7ead51daa2b6803b293b2518b882feb3ac4f1af03799375683b821306ed7eb7","bytes":54,"mode":644}],"sig":"4a8b1ddbb60ace0daa587fb4416a4026c2589fe75fd17c7b8420e9818d923488e5a45bd20ae11adf3254333702364fffa6fee3cbfd0281fdc706aa1314d89d0d"}'
+MANIFEST_UNKNOWN = '{"stream":"0199de2d-dc00-7000-8000-000000000010","change":"0199de2d-dc00-7000-8000-000000000999","author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","files":[{"path":"go/sample.go","blob":"b7ead51daa2b6803b293b2518b882feb3ac4f1af03799375683b821306ed7eb7","bytes":54,"mode":644}],"sig":"2303a4d6647186e67d0ca816182ec682075eefdf334ebb18eea79faace110f6be7cf5f346580520c11a27b149b0e9c63bfc26566b3ebfee097c061d3a454c20e"}'
+BLOB_BYTES = b"adversarial blob payload\n"
+BLOB_ID = __import__("hashlib").sha256(BLOB_BYTES).hexdigest()
+
 
 def load_vectors():
     changes = []
@@ -413,6 +432,174 @@ def test_fork_chain(port, changes, head):
     c.close()
 
 
+def test_deposit(port, changes, head):
+    """spec_rev 3 deposit op: detached lines land without moving the head,
+    resends are idempotent, and every abuse case refuses by name."""
+    c = hello(port)
+    base = {"op": "deposit", "stream": STREAM}
+
+    r = c.call({"op": "deposit", "seq": 1, "stream": STREAM})
+    check("deposit without changes refuses usage", refused(r, "usage"), r)
+    r = c.call({**base, "seq": 2, "changes": "nope"})
+    check("deposit with non-array changes refuses usage", refused(r, "usage"), r)
+    r = c.call({**base, "seq": 3, "changes": [42]})
+    check("deposit non-string change entry refuses", r is not None and r.get("ok") is False, r)
+    r = c.call({**base, "seq": 4, "changes": []})
+    check("deposit empty batch refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({"op": "deposit", "seq": 5, "stream": "0199de2d-dc00-7000-8000-0000000000aa",
+                "changes": [DETACHED]})
+    check("deposit on unknown stream refuses stream_missing", refused(r, "stream_missing"), r)
+
+    # A well-formed detached line whose signature fails refuses sig_invalid.
+    bad_sig = DETACHED.replace("preserved recovery original", "preserved recovery oxiginal")
+    r = c.call({**base, "seq": 6, "changes": [bad_sig]})
+    check("deposit bad signature refuses sig_invalid", refused(r, "sig_invalid"), r)
+    # Validly signed, but a detached Change may not extend the current head.
+    r = c.call({**base, "seq": 7, "changes": [EXTENDS_HEAD]})
+    check("deposit with parent=head refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({**base, "seq": 8, "changes": [ORPHAN]})
+    check("deposit with unknown parent refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({**base, "seq": 9, "changes": [changes[0]] * 257})
+    check("deposit batch over 256 refuses change_malformed", refused(r, "change_malformed"), r)
+
+    # Nothing refused above may have been written.
+    r = c.call({"op": "read", "seq": 10, "stream": STREAM})
+    check("refused deposits left the log untouched",
+          r.get("changes") == changes and r.get("head") == head, str(r)[:160])
+
+    # Happy path by name: a detached line stores, head echoes unchanged.
+    r = c.call({"op": "deposit", "seq": 11, "stream": "main", "changes": [DETACHED]})
+    check("deposit of a detached change stores it, head unmoved",
+          r is not None and r.get("ok") is True and r.get("stored") == 1 and r.get("head") == head, r)
+    r = c.call({**base, "seq": 12, "changes": [DETACHED]})
+    check("re-deposit of identical bytes is a no-op (stored=0)",
+          r is not None and r.get("ok") is True and r.get("stored") == 0 and r.get("head") == head, r)
+    r = c.call({**base, "seq": 13, "changes": [DETACHED + " "]})
+    check("same id under different bytes refuses change_malformed", refused(r, "change_malformed"), r)
+    # A child rooted at the just-deposited line resolves its parent in-log.
+    r = c.call({**base, "seq": 14, "changes": [DETACHED_CHILD]})
+    check("deposit child of a detached line stores",
+          r is not None and r.get("ok") is True and r.get("stored") == 1, r)
+
+    r = c.call({"op": "read", "seq": 15, "stream": STREAM})
+    check("read returns deposited detached lines verbatim",
+          r.get("changes") == changes + [DETACHED, DETACHED_CHILD] and r.get("head") == head,
+          str(r)[:160])
+    r = c.call({"op": "heads", "seq": 16})
+    check("heads still shows the pre-deposit head", r.get("heads", {}).get(STREAM) == head, r)
+    c.close()
+
+
+def test_content_ops(port, changes, head):
+    """spec_rev 4 content ops: blob_put/blob_get and put_manifest/get_manifest
+    happy paths plus the refusal surface for bad hashes, bad bindings, torn
+    paths, conflicts, and oversize payloads."""
+    c = hello(port)
+
+    # --- blob_put / blob_get ------------------------------------------
+    r = c.call({"op": "blob_put", "seq": 1, "id": BLOB_ID, "hex": BLOB_BYTES.hex()})
+    check("blob_put stores a well-formed blob", r is not None and r.get("ok") is True, r)
+    r = c.call({"op": "blob_put", "seq": 2, "id": BLOB_ID, "hex": BLOB_BYTES.hex()})
+    check("blob_put resend is idempotent", r is not None and r.get("ok") is True, r)
+    r = c.call({"op": "blob_get", "seq": 3, "id": BLOB_ID})
+    check("blob_get returns the exact bytes", r is not None and r.get("hex") == BLOB_BYTES.hex(), r)
+
+    for label, req, want in [
+        ("blob_put missing id", {"op": "blob_put", "seq": 4, "hex": "aa"}, "usage"),
+        ("blob_put missing hex", {"op": "blob_put", "seq": 5, "id": BLOB_ID}, "usage"),
+        ("blob_put non-string hex", {"op": "blob_put", "seq": 6, "id": BLOB_ID, "hex": 7}, "usage"),
+        ("blob_put short id", {"op": "blob_put", "seq": 7, "id": "ab", "hex": "aa"}, "blob_malformed"),
+        ("blob_put uppercase id", {"op": "blob_put", "seq": 8, "id": BLOB_ID.upper(), "hex": BLOB_BYTES.hex()}, "blob_malformed"),
+        ("blob_put wrong hash", {"op": "blob_put", "seq": 9, "id": "0" * 64, "hex": BLOB_BYTES.hex()}, "blob_malformed"),
+        ("blob_put non-hex payload", {"op": "blob_put", "seq": 10, "id": BLOB_ID, "hex": "zz"}, "blob_malformed"),
+        ("blob_put odd-length hex", {"op": "blob_put", "seq": 11, "id": BLOB_ID, "hex": "abc"}, "blob_malformed"),
+        ("blob_get missing id", {"op": "blob_get", "seq": 12}, "usage"),
+        ("blob_get unknown blob", {"op": "blob_get", "seq": 13, "id": "1" * 64}, "blob_missing"),
+        ("blob_get bad id shape", {"op": "blob_get", "seq": 14, "id": "nope"}, "blob_malformed"),
+    ]:
+        r = c.call(req)
+        check(label + " refuses " + want, refused(r, want), r)
+
+    r = c.call({"op": "blob_put", "seq": 15, "id": BLOB_ID, "hex": "aa" * (1800000 + 1)})
+    check("blob_put over the 1,800,000-byte cap refuses change_too_large",
+          refused(r, "change_too_large"), r)
+
+    # --- put_manifest --------------------------------------------------
+    for label, req, want in [
+        ("put_manifest missing stream", {"op": "put_manifest", "seq": 16, "lines": [MANIFEST_C1]}, "usage"),
+        ("put_manifest missing lines", {"op": "put_manifest", "seq": 17, "stream": STREAM}, "usage"),
+        ("put_manifest non-array lines", {"op": "put_manifest", "seq": 18, "stream": STREAM, "lines": "x"}, "usage"),
+        ("put_manifest non-string line", {"op": "put_manifest", "seq": 19, "stream": STREAM, "lines": [42]}, "change_malformed"),
+        ("put_manifest empty batch", {"op": "put_manifest", "seq": 20, "stream": STREAM, "lines": []}, "change_malformed"),
+        ("put_manifest unknown stream", {"op": "put_manifest", "seq": 21, "stream": "0199de2d-dc00-7000-8000-0000000000aa",
+                                         "lines": [MANIFEST_C1]}, "stream_missing"),
+        ("put_manifest unknown change", {"op": "put_manifest", "seq": 22, "stream": STREAM, "lines": [MANIFEST_UNKNOWN]}, "change_missing"),
+    ]:
+        r = c.call(req)
+        check(label + " refuses " + want, refused(r, want), r)
+
+    # A manifest signed for a different change fails verification; a
+    # containment-breaking path is manifest_torn; a foreign stream binding
+    # is change_malformed.
+    bad_sig = MANIFEST_DET.replace(
+        '"change":"0199de2d-dc00-7000-8000-000000000102"',
+        '"change":"0199de2d-dc00-7000-8000-000000000105"')
+    r = c.call({"op": "put_manifest", "seq": 23, "stream": STREAM, "lines": [bad_sig]})
+    check("put_manifest wrong-change signature refuses sig_invalid", refused(r, "sig_invalid"), r)
+    bad_path = MANIFEST_C1.replace('"path":"go/sample.go"', '"path":"../escape.go"')
+    r = c.call({"op": "put_manifest", "seq": 24, "stream": STREAM, "lines": [bad_path]})
+    check("put_manifest path escape refuses manifest_torn", refused(r, "manifest_torn"), r)
+    wrong_stream = MANIFEST_C1.replace('"stream":"0199de2d-dc00-7000-8000-000000000010"',
+                                       '"stream":"0199de2d-dc00-7000-8000-0000000000aa"')
+    r = c.call({"op": "put_manifest", "seq": 25, "stream": STREAM, "lines": [wrong_stream]})
+    check("put_manifest foreign stream binding refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({"op": "put_manifest", "seq": 26, "stream": STREAM, "lines": [MANIFEST_C1] * 257})
+    check("put_manifest batch over 256 refuses change_malformed", refused(r, "change_malformed"), r)
+    unsorted = MANIFEST_C1.replace(
+        '"files":[{"path":"go/sample.go"',
+        '"files":[{"path":"z/z.go","blob":"' + "0" * 64 + '","bytes":0,"mode":644},{"path":"go/sample.go"')
+    r = c.call({"op": "put_manifest", "seq": 27, "stream": STREAM, "lines": [unsorted]})
+    check("put_manifest unsorted inventory refuses change_malformed", refused(r, "change_malformed"), r)
+
+    # Nothing refused above may have been written.
+    r = c.call({"op": "get_manifest", "seq": 28, "stream": STREAM, "after": None})
+    check("refused manifests left the log empty", r is not None and r.get("ok") and r.get("lines") == [], r)
+
+    r = c.call({"op": "put_manifest", "seq": 29, "stream": "main", "lines": [MANIFEST_C1, MANIFEST_DET]})
+    check("put_manifest stores chain + detached manifests, head untouched",
+          r is not None and r.get("ok") is True and r.get("stored") == 2, r)
+    r = c.call({"op": "put_manifest", "seq": 30, "stream": STREAM, "lines": [MANIFEST_C1]})
+    check("put_manifest resend skips stored bytes", r is not None and r.get("stored") == 0, r)
+    conflict = re.sub(r'("sig":")([0-9a-f])', lambda m: m[1] + ("0" if m[2] != "0" else "1"), MANIFEST_C1)
+    r = c.call({"op": "put_manifest", "seq": 31, "stream": STREAM, "lines": [conflict]})
+    check("put_manifest same change different bytes refuses change_malformed",
+          refused(r, "change_malformed"), r)
+
+    # --- get_manifest --------------------------------------------------
+    first = json.loads(changes[0])["id"]
+    r = c.call({"op": "get_manifest", "seq": 32, "stream": STREAM, "after": None})
+    check("get_manifest returns the stored lines verbatim",
+          r is not None and r.get("lines") == [MANIFEST_C1, MANIFEST_DET], r)
+    r = c.call({"op": "get_manifest", "seq": 33, "stream": STREAM, "after": first})
+    check("get_manifest after first returns manifests for the rest of the log",
+          r is not None and r.get("lines") == [MANIFEST_DET], r)
+    r = c.call({"op": "get_manifest", "seq": 34, "stream": STREAM, "after": "0199de2d-dc00-7000-8000-000000000105"})
+    check("get_manifest after last change is empty", r is not None and r.get("lines") == [], r)
+    r = c.call({"op": "get_manifest", "seq": 35, "stream": STREAM, "after": "0199de2d-dc00-7000-8000-000000000999"})
+    check("get_manifest unknown after refuses change_missing", refused(r, "change_missing"), r)
+    r = c.call({"op": "get_manifest", "seq": 36, "stream": "0199de2d-dc00-7000-8000-0000000000aa", "after": None})
+    check("get_manifest unknown stream refuses stream_missing", refused(r, "stream_missing"), r)
+    r = c.call({"op": "get_manifest", "seq": 37, "stream": STREAM})
+    check("get_manifest missing after defaults to whole log",
+          r is not None and r.get("lines") == [MANIFEST_C1, MANIFEST_DET], r)
+
+    r = c.call({"op": "heads", "seq": 38})
+    check("content publication never moved the head", r.get("heads", {}).get(STREAM) == head, r)
+    r = c.call({"op": "read", "seq": 39, "stream": STREAM})
+    check("change log untouched by content ops", r.get("head") == head and len(r.get("changes", [])) == 4, r)
+    c.close()
+
+
 def test_connection_stress(port):
     # Idle connections must not block an active client.
     idle = [Conn(port) for _ in range(4)]
@@ -490,11 +677,13 @@ def test_concurrent_create_race(port):
 
 
 def test_persistence_and_recovery(store, changes, head):
+    # The deposit leg appended two detached lines; they persist verbatim too.
+    expected_lines = changes + [DETACHED, DETACHED_CHILD]
     proc, port = start(store)
     try:
         c = hello(port)
         r = c.call({"op": "read", "seq": 1, "stream": STREAM})
-        check("changes survive a server restart byte-identically", r.get("changes") == changes and r.get("head") == head, str(r)[:160])
+        check("changes survive a server restart byte-identically", r.get("changes") == expected_lines and r.get("head") == head, str(r)[:160])
         c.close()
     finally:
         stop(proc)
@@ -553,7 +742,11 @@ def test_auth(directory, changes):
         check("auth server issues a 32-hex nonce", isinstance(nonce, str) and re.fullmatch("[0-9a-f]{32}", nonce), r)
         for verb in [{"op": "list"}, {"op": "heads"}, {"op": "create", "record": record()},
                      {"op": "open", "stream": "main"}, {"op": "read", "stream": STREAM},
-                     {"op": "append", "stream": STREAM, "expected_head": None, "changes": changes[:1]}]:
+                     {"op": "append", "stream": STREAM, "expected_head": None, "changes": changes[:1]},
+                     {"op": "put_manifest", "stream": STREAM, "lines": [MANIFEST_C1]},
+                     {"op": "get_manifest", "stream": STREAM, "after": None},
+                     {"op": "blob_put", "id": BLOB_ID, "hex": BLOB_BYTES.hex()},
+                     {"op": "blob_get", "id": BLOB_ID}]:
             r = c.call({**verb, "seq": 2})
             check("unauthenticated %s refuses auth_required" % verb["op"], refused(r, "auth_required"), r)
         r = c.call({"op": "auth", "seq": 3, "nonce": nonce, "hmac": "0" * 64})
@@ -612,7 +805,12 @@ def test_allow_author(directory, changes):
         c.call({"op": "create", "seq": 2, "record": record()})
         r = c.call({"op": "append", "seq": 3, "stream": STREAM, "expected_head": None, "changes": changes})
         check("author outside the allowlist refuses author_not_allowed", refused(r, "author_not_allowed"), r)
-        r = c.call({"op": "read", "seq": 4, "stream": STREAM})
+        # The author gate mirrors append's order (after signature and parent
+        # checks): on an empty stream DETACHED's parent cannot resolve, so the
+        # refusal surfaces as change_malformed rather than author_not_allowed.
+        r = c.call({"op": "deposit", "seq": 4, "stream": STREAM, "changes": [DETACHED]})
+        check("deposit on a gated empty stream refuses cleanly", refused(r, "change_malformed"), r)
+        r = c.call({"op": "read", "seq": 5, "stream": STREAM})
         check("disallowed author left no log", r.get("changes") == [], r)
         c.close()
     finally:
@@ -643,6 +841,10 @@ def test_read_only_store(directory, changes):
             for f in files:
                 os.chmod(os.path.join(root, f), mode_files)
 
+    # Content dirs are created lazily — pre-create them so the chmod applies
+    # and the write paths inside fail like every other store write.
+    os.makedirs(os.path.join(ro, "blobs", BLOB_ID[:2]), exist_ok=True)
+    os.makedirs(os.path.join(ro, "manifests"), exist_ok=True)
     tree_mode(0o555, 0o444)
     try:
         proc, port = start(ro, [])
@@ -654,6 +856,10 @@ def test_read_only_store(directory, changes):
             r = c.call({"op": "append", "seq": 2, "stream": STREAM,
                         "expected_head": head, "changes": changes[1:]})
             check("read-only store: append refuses store_io", refused(r, "store_io"), r)
+            r = c.call({"op": "blob_put", "seq": 4, "id": BLOB_ID, "hex": BLOB_BYTES.hex()})
+            check("read-only store: blob_put refuses store_io", refused(r, "store_io"), r)
+            r = c.call({"op": "put_manifest", "seq": 5, "stream": STREAM, "lines": [MANIFEST_C1]})
+            check("read-only store: put_manifest refuses store_io", refused(r, "store_io"), r)
             r = c.call({"op": "read", "seq": 3, "stream": STREAM})
             check("read-only store: read still serves",
                   r is not None and r.get("ok") and r.get("head") == head, r)
@@ -715,6 +921,8 @@ def main():
             head = run_test(test_append_validation, port, changes)
             run_test(test_read_semantics, port, changes, head)
             run_test(test_fork_chain, port, changes, head)
+            run_test(test_deposit, port, changes, head)
+            run_test(test_content_ops, port, changes, head)
             run_test(test_oversize, port)
             run_test(test_connection_stress, port)
             run_test(test_concurrent_create_race, port)

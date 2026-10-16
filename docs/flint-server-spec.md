@@ -42,7 +42,7 @@ should serve this protocol so guest and host are interchangeable endpoints.
 - Refusal names are the ADR/Go vocabulary (`stream_missing`,
   `stream_exists`, `stale_head`, `change_malformed`, `sig_invalid`,
   `store_too_large`, `stream_malformed`, `stream_torn`,
-  `message_invalid`, `usage`, …). Wire additions are listed in §2.5 and
+  `message_invalid`, `usage`, …). Wire additions are listed in §2.7 and
   nowhere else.
 - No GPL-family code anywhere (VirelaiOS rule; carries over).
 
@@ -117,9 +117,14 @@ Refusal:
 | `read` | `stream`, `after` (optional change id), `limit` (optional, default 256, max 1024) | `record`, `head`, `changes:[<raw line>,…]`, `more` | `stream_missing`, `change_missing` (unknown `after`) |
 | `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`/`change_missing` (bad `forked_from`), `store_io` |
 | `append` | `stream` (id), `expected_head` (nullable), `changes:[<raw line>,…]` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed`, `store_io` |
+| `deposit` | `stream` (id or name), `changes:[<raw line>,…]` (1–256) | `head:<unchanged head>`, `stored:<count>` | `stream_missing`, `change_malformed`, `sig_invalid`, `message_invalid`, `author_not_allowed`, `store_too_large`, `store_io` |
+| `put_manifest` | `stream` (id or name), `lines:[<raw line>,…]` (1–256) | `stored:<count>` | `stream_missing`, `change_missing`, `change_malformed`, `manifest_torn`, `sig_invalid`, `author_not_allowed`, `store_too_large`, `store_io` |
+| `get_manifest` | `stream`, `after` (optional change id) | `lines:[<raw line>,…]` | `stream_missing`, `change_missing`, `manifest_torn`, `store_too_large` |
+| `blob_put` | `id`, `hex` | `ok:true` | `blob_malformed`, `change_too_large`, `store_io` |
+| `blob_get` | `id` | `hex:<lowercase hex>` | `blob_missing`, `blob_malformed`, `store_too_large`, `store_io` |
 
-`stream`/`after` fields take canonical lowercase UUID strings; `open` also
-accepts a stream **name**.
+`stream`/`after` fields take canonical lowercase UUID strings; `open`,
+`deposit`, and `put_manifest` also accept a stream **name**.
 
 `hello` success replies announce `spec_rev`, the server's
 protocol-visible spec revision (repo-root `SPECREV`;
@@ -161,7 +166,55 @@ Nothing is appended unless the entire batch validates. `merged` Changes
 (the merge records) ride this path unchanged — the server does not
 interpret them.
 
-### 2.4 `create` semantics
+### 2.4 `deposit` semantics — detached Change lines (spec_rev 3)
+
+A stream's `.jsonl` is append-only and may contain **detached** Change
+lines — valid signed Changes of that stream that do not sit on the
+head's first-parent chain. `deposit` appends such lines to an existing
+stream's log without moving the record head, so preserved work — the
+original signed Change behind a saved recovery fork, or any Change a
+merge's signed `merged` link names — becomes retrievable by `read`.
+No new retrieval op is needed.
+
+Request `{stream: <id-or-name>, changes: [<raw line>, …]}`; reply
+`{"ok":true,"head":<unchanged head or null>,"stored":<m>}`.
+
+For each batch on stream `S`:
+
+1. Resolve `S` → else `stream_missing`. An empty or oversize batch is
+   `change_malformed` (1–256 raw lines per request).
+2. Validate **all** Changes before appending any, mirroring §2.3:
+   `ParseChange` each raw line → `change_malformed`; `c.stream == S.id`
+   → `change_malformed`; message bounds → `message_invalid`;
+   `VerifyChange` → `sig_invalid`; `--allow-author` →
+   `author_not_allowed`. Then the detached rules:
+   - A non-duplicate Change whose `parent` equals the current head is an
+     `append`, not a deposit → `change_malformed` (`extends head`).
+   - Every deposited `parent` must otherwise be null, an id already in
+     `S`'s log, `S`'s `forked_from.change`, or an id earlier in the same
+     batch → `change_malformed` (`detached parent unknown`). Deposits
+     are therefore ancestry-complete: a stored detached Change's whole
+     first-parent ancestry back to a root or to existing log content is
+     present in the log.
+   - Dedupe by id: a byte-identical repeat is skipped and does not count
+     toward `stored`; the same id under different bytes refuses
+     `change_malformed` (`id conflict`). Deposits are idempotent — an
+     interrupted transfer reconciles by re-sending.
+3. The `MaxChanges` (4096) and 4 MiB log bounds count detached lines too
+   → `store_too_large`.
+4. Append the newly stored raw lines to `streams/<id>.jsonl` and fsync.
+   The stream record is never rewritten — `head` does not move and is
+   echoed back for confirmation.
+
+Readers tolerate a log that interleaves detached lines with the head
+chain: on load, a line whose `parent` continues the first-parent chain
+advances the chain cursor; anything else is detached and must verify
+(`sig_invalid` unchanged) with a `parent` that is null or already-seen
+content — `change_malformed` otherwise. The record head is checked
+against the chain cursor, not the last log line, and append crash
+recovery (§3.1) rolls forward to the cursor, never to a detached line.
+
+### 2.5 `create` semantics
 
 - Validate the record shape: `id`/`name`/`created` present; `name` is
   `[a-z0-9-]{1,32}`; `id` parses as UUID → else `stream_malformed`.
@@ -178,10 +231,92 @@ interpret them.
 - Write `streams/<id>.json` only. The `.jsonl` is created lazily by the
   first `append` — identical to the guest `fork`, which writes no log.
 
-### 2.5 Wire-only refusal names (additions to the vocabulary)
+### 2.6 Content ops — manifests and blobs (spec_rev 4)
+
+The content layer implements the server half of flint-client's approved
+`docs/flint-blobs-spec.md` (client #77): signed manifests bind a Change to
+the complete inventory of the tracked source root, and blobs hold the
+whole-file bytes that inventory references. The Change log is untouched:
+these ops never move a stream head and never rewrite accepted Change bytes.
+
+Store layout deltas (new top-level directories, created lazily on first
+write and ignored by pre-content readers):
+
+```
+<store>/
+  blobs/<2 hex>/<62 hex>          blob bytes, id = SHA-256(raw bytes)
+  manifests/<stream-uuid>.jsonl   one signed manifest line per Change, append-only
+```
+
+A manifest line is one signed JSON object in Go field order with `files`
+sorted by `path`:
+
+```json
+{"stream":"<stream-uuid>","change":"<change-uuid>","author":"<64-hex>","files":[{"path":"src/main.zig","blob":"<64-hex>","bytes":1234,"mode":644}],"sig":"<128-hex>"}
+```
+
+Every `files` entry carries `path`, `blob`, `bytes`, `mode`; `reason`
+(`"too_large"`/`"unsupported"`) appears only on `blob:null` entries and is
+required there. `path` is a normalized relative path — `/` separators, no
+empty/`.`/`..` segments, no leading `/` — else `manifest_torn` (§5 of the
+blobs spec names that refusal for this violation; other malformed line
+content is `change_malformed`). The signature domain is deliberately
+disjoint from Changes: `sig` is the Change author's Ed25519 signature over
+`"flint-manifest-v1\n" || canonical(<stream,change,author,files>)`, the
+canonical JSON form above with `sig` excluded.
+
+For each `put_manifest` batch on stream `S` (1–256 lines per request,
+mirroring `deposit`; all-or-nothing):
+
+1. Resolve `S` (id or name) → else `stream_missing`. Parse each line →
+   `change_malformed` for shape failures, `manifest_torn` for path
+   violations; `m.stream == S.id` → else `change_malformed`.
+2. Dedupe by `change` like `deposit` dedupes by Change id: a
+   byte-identical repeat skips and does not count toward `stored`; the
+   same `change` under different bytes refuses `change_malformed`
+   (`id conflict`). Repeats are checked against the manifest log and
+   earlier lines in the same batch.
+3. `m.change` must resolve to a Change in `S`'s log — head chain or a
+   `deposit`ed detached line alike — else `change_missing`. `m.author`
+   must equal that Change's `author`, and `sig` must verify under the
+   Change author's key → `sig_invalid`. `--allow-author` gates
+   `author_not_allowed` exactly as for Changes.
+4. Bounds: the manifest log stays ≤ 4096 lines (the Change bound's
+   shadow) and each line ≤ 4 MiB → `store_too_large`. The server also
+   bounds a manifest log file at 256 MiB — a defensive read bound the
+   contract leaves implicit (it bounds lines, not bytes).
+5. Append the newly stored raw lines to `manifests/<id>.jsonl` and fsync.
+   The stream record is never rewritten and the manifest log never
+   moves the head.
+
+`get_manifest` returns manifest lines verbatim, in log order, for the
+change range `read`'s `after` cursor would produce: a null `after` yields
+the whole manifest log; a change id yields the lines bound to changes
+after it in `S`'s log; an `after` that resolves only through the fork
+chain (same rule as `read`) yields everything; an unknown `after` refuses
+`change_missing`. A stream with no manifests returns an empty `lines`.
+A torn final line or unparseable line inside the manifest log refuses
+`manifest_torn` — the log is append-only and never rewritten, so corrupt
+content is surfaced rather than served.
+
+`blob_put` stores `hex`-decoded bytes at `blobs/<id[0..2]>/<id[2..]>` via
+the crash-safe write. `id` must be the lowercase-hex SHA-256 of the
+decoded bytes — mismatch, undecodable hex, or a non-hex id refuses
+`blob_malformed`; decoded size over 1,800,000 bytes refuses
+`change_too_large`. Blob ids are content-addressed, so an already-present
+id is idempotently `ok:true`.
+
+`blob_get` returns the stored bytes as lowercase hex. A missing id
+refuses `blob_missing`; the stored bytes are re-hashed on every read and
+a mismatch refuses `blob_malformed` (a corrupt or substituted blob fails
+its id check).
+
+### 2.7 Wire-only refusal names (additions to the vocabulary)
 
 `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`,
-`store_not_found`, `store_missing`, `store_io`. Everything else is the
+`store_not_found`, `store_missing`, `store_io`, `change_too_large`. The
+content layer adds `manifest_torn`, `blob_missing`, `blob_malformed` from
+the blobs spec's contractual vocabulary. Everything else is the
 existing ADR/Go vocabulary — a refusal arriving over the wire prints on
 the client as `flint: refuse <name>` with no translation table.
 
@@ -290,8 +425,10 @@ lands in this repo in order.
 - TLS / transport encryption (loopback, LAN, or `--stdio` under an
   authenticated channel; TLS can layer on later without changing the
   protocol).
-- Content store / blob transport, checkout, materialization (FLINT M1
-  scope in VirelaiOS).
+- Checkout, materialization, source-root tracking, merge materialization,
+  `gc`, and sparse serving — the content layer's client half (§2.6 serves
+  the store records; reconstructing a workspace is the client's job).
+  Server-side blob GC scheduling, quotas, and per-stream blob ACLs.
 - `ws/`, `MERGE.json`, `ATOMS.jsonl`/`STAGE.jsonl` sync — workspace state
   stays per-host; only `streams/` replicates.
 - Multi-store serving, per-stream ACLs, quotas, rate limits, discovery.

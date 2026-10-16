@@ -59,6 +59,8 @@ makes several protocol-visible changes still bumps once.
 |---|---|---|
 | 1 | `SPECREV` convention; `hello` ok replies announce `spec_rev` | [#34](https://github.com/drawmeanelephant/flint-server/issues/34) |
 | 2 | `store_io` refusal name for store filesystem failures (was `stream_malformed`) | [#36](https://github.com/drawmeanelephant/flint-server/issues/36) |
+| 3 | `deposit` op: detached Change lines appended to a stream log without moving the head; store loading tolerates detached lines | [#40](https://github.com/drawmeanelephant/flint-server/issues/40) |
+| 4 | Content layer (flint-client `docs/flint-blobs-spec.md` §9): `put_manifest`/`get_manifest`/`blob_put`/`blob_get` ops; `manifests/<stream>.jsonl` signed-inventory log and `blobs/<2hex>/<62hex>` store layout; new refusal names `manifest_torn`, `blob_missing`, `blob_malformed`, `change_too_large` | [#43](https://github.com/drawmeanelephant/flint-server/issues/43) |
 
 ## 3. The `hello` `spec_rev` field
 

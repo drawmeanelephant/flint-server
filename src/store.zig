@@ -8,6 +8,18 @@ pub const MaxStreamNameBytes: usize = 32;
 pub const MaxLineBytes: usize = 4 * 1024 * 1024;
 pub const DefaultReadLimit: usize = 256;
 pub const MaxReadLimit: usize = 1024;
+pub const MaxDepositBatch: usize = 256;
+
+// Content layer (flint-client docs/flint-blobs-spec.md §6, spec_rev 4).
+// A blob's decoded size is capped so its hex form fits a 4 MiB NDJSON line;
+// put_manifest batches mirror deposit's 256; the manifest log shadows the
+// Change bound at one line per Change. MaxManifestLogBytes is the server's
+// defensive read bound for a whole manifest log file — the contract bounds
+// only line size and line count, but get_manifest loads the log whole.
+pub const MaxBlobBytes: usize = 1_800_000;
+pub const MaxManifestBatch: usize = 256;
+pub const MaxManifestLines: usize = MaxChanges;
+pub const MaxManifestLogBytes: usize = 256 * 1024 * 1024;
 
 pub const RefusalCode = enum {
     stream_missing,
@@ -29,6 +41,10 @@ pub const RefusalCode = enum {
     store_missing,
     store_io,
     secret_malformed,
+    manifest_torn,
+    blob_missing,
+    blob_malformed,
+    change_too_large,
 
     pub fn asText(self: RefusalCode) []const u8 {
         return switch (self) {
@@ -51,6 +67,10 @@ pub const RefusalCode = enum {
             .store_missing => "store_missing",
             .store_io => "store_io",
             .secret_malformed => "secret_malformed",
+            .manifest_torn => "manifest_torn",
+            .blob_missing => "blob_missing",
+            .blob_malformed => "blob_malformed",
+            .change_too_large => "change_too_large",
         };
     }
 };
@@ -246,6 +266,88 @@ pub const Change = struct {
     }
 };
 
+/// One entry of a manifest's `files` inventory: a normalized relative path
+/// and the blob id holding its bytes, or `blob = null` plus `reason` for an
+/// explicitly incomplete entry (`"too_large"`/`"unsupported"`).
+/// (`docs/flint-blobs-spec.md` §1 in flint-client.)
+pub const ManifestFile = struct {
+    path: []const u8,
+    blob: ?[]const u8,
+    bytes: u64,
+    mode: u32,
+    reason: ?[]const u8 = null,
+
+    pub fn clone(self: ManifestFile, allocator: Allocator) !ManifestFile {
+        const path_copy = try allocator.dupe(u8, self.path);
+        errdefer allocator.free(path_copy);
+        const blob_copy = if (self.blob) |b| try allocator.dupe(u8, b) else null;
+        errdefer if (blob_copy) |b| allocator.free(b);
+        const reason_copy = if (self.reason) |r| try allocator.dupe(u8, r) else null;
+        return .{
+            .path = path_copy,
+            .blob = blob_copy,
+            .bytes = self.bytes,
+            .mode = self.mode,
+            .reason = reason_copy,
+        };
+    }
+
+    pub fn deinit(self: *ManifestFile, allocator: Allocator) void {
+        allocator.free(self.path);
+        if (self.blob) |b| allocator.free(b);
+        if (self.reason) |r| allocator.free(r);
+    }
+};
+
+/// A signed manifest line: the Change author's attestation binding a
+/// revision to its complete source inventory. `sig` covers the
+/// `flint-manifest-v1` domain-separated canonical form (see manifest.zig).
+pub const Manifest = struct {
+    stream: []const u8,
+    change: []const u8,
+    author: []const u8,
+    files: []ManifestFile,
+    sig: []const u8,
+
+    pub fn clone(self: Manifest, allocator: Allocator) !Manifest {
+        const stream_copy = try allocator.dupe(u8, self.stream);
+        errdefer allocator.free(stream_copy);
+        const change_copy = try allocator.dupe(u8, self.change);
+        errdefer allocator.free(change_copy);
+        const author_copy = try allocator.dupe(u8, self.author);
+        errdefer allocator.free(author_copy);
+
+        const files_copy = try allocator.alloc(ManifestFile, self.files.len);
+        var initialized_files: usize = 0;
+        errdefer {
+            for (files_copy[0..initialized_files]) |*f| f.deinit(allocator);
+            allocator.free(files_copy);
+        }
+        for (self.files, 0..) |f, i| {
+            files_copy[i] = try f.clone(allocator);
+            initialized_files += 1;
+        }
+
+        const sig_copy = try allocator.dupe(u8, self.sig);
+        return .{
+            .stream = stream_copy,
+            .change = change_copy,
+            .author = author_copy,
+            .files = files_copy,
+            .sig = sig_copy,
+        };
+    }
+
+    pub fn deinit(self: *Manifest, allocator: Allocator) void {
+        allocator.free(self.stream);
+        allocator.free(self.change);
+        allocator.free(self.author);
+        for (self.files) |*f| f.deinit(allocator);
+        allocator.free(self.files);
+        allocator.free(self.sig);
+    }
+};
+
 pub fn isLowerHexByte(c: u8) bool {
     return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
 }
@@ -266,7 +368,7 @@ pub fn isValidHex128(s: []const u8) bool {
     return isLowerHexLen(s, 128);
 }
 
-fn hexNibble(c: u8) ?u4 {
+pub fn hexNibble(c: u8) ?u4 {
     if (c >= '0' and c <= '9') return @intCast(c - '0');
     if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
     return null;

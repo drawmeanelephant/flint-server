@@ -4,6 +4,7 @@ const store = @import("store.zig");
 const json = @import("json.zig");
 const ed25519 = @import("ed25519.zig");
 const change = @import("change.zig");
+const manifest = @import("manifest.zig");
 const jsonl = @import("jsonl.zig");
 const storeio = @import("storeio.zig");
 const auth = @import("auth.zig");
@@ -276,12 +277,18 @@ test {
     _ = json;
     _ = ed25519;
     _ = change;
+    _ = manifest;
     _ = jsonl;
     _ = storeio;
     _ = @import("indexcache.zig");
+    _ = @import("indexcache_test.zig");
     _ = auth;
     _ = proto;
     _ = serve;
     _ = @import("logging.zig");
+    _ = @import("deposit_test.zig");
+    _ = @import("blobs_test.zig");
+    _ = @import("contentio.zig");
+    _ = @import("content_ops.zig");
     _ = @import("conformance_test.zig");
 }

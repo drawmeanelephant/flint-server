@@ -1,6 +1,6 @@
 # Golden transcript: hello, list on empty store, heads on empty store
 > {"op":"hello","seq":1,"proto":"FLINT-SYNC/1"}
-< {"seq":1,"ok":true,"proto":"FLINT-SYNC/1","server":"flintd","spec_rev":2}
+< {"seq":1,"ok":true,"proto":"FLINT-SYNC/1","server":"flintd","spec_rev":4}
 > {"op":"list","seq":2}
 < {"seq":2,"ok":true,"streams":[]}
 > {"op":"heads","seq":3}
