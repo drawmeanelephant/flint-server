@@ -341,6 +341,14 @@ test "M106f: golden transcript deposit.ndjson — detached lines, idempotent res
     try replayTranscript(allocator, .{ .root_path = ts.root_path }, "testdata/sync/deposit.ndjson");
 }
 
+test "spec_rev 4: golden transcript blobs.ndjson — content ops, detached manifest, refusals" {
+    const allocator = std.testing.allocator;
+    var ts = try TempStore.init(allocator);
+    defer ts.deinit(allocator);
+
+    try replayTranscript(allocator, .{ .root_path = ts.root_path }, "testdata/sync/blobs.ndjson");
+}
+
 test "M106d & M106f: golden transcript auth_refuse.ndjson and successful HMAC auth + allowlist files" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

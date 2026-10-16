@@ -6,6 +6,8 @@ const ForkOrigin = store.ForkOrigin;
 const Stream = store.Stream;
 const Op = store.Op;
 const Change = store.Change;
+const Manifest = store.Manifest;
+const ManifestFile = store.ManifestFile;
 
 pub const ParseError = error{
     ChangeMalformed,
@@ -190,6 +192,63 @@ pub fn marshalChangeLine(allocator: Allocator, c: *const Change) Allocator.Error
     defer aw.deinit();
     writeChange(&aw.writer, c) catch return error.OutOfMemory;
     aw.writer.writeByte('\n') catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
+/// Writes one manifest `files` entry in Go field order
+/// (`path`, `blob`, `bytes`, `mode`, then `reason` only when `blob` is null),
+/// matching the signed-inventory record in `docs/flint-blobs-spec.md` §1.
+pub fn writeManifestFile(w: *std.Io.Writer, f: ManifestFile) std.Io.Writer.Error!void {
+    try w.writeAll("{\"path\":");
+    try writeGoJsonString(w, f.path);
+    try w.writeAll(",\"blob\":");
+    try writeNullableString(w, f.blob);
+    try w.print(",\"bytes\":{d},\"mode\":{d}", .{ f.bytes, f.mode });
+    if (f.blob == null) {
+        try w.writeAll(",\"reason\":");
+        try writeNullableString(w, f.reason);
+    }
+    try w.writeByte('}');
+}
+
+/// Writes a manifest's canonical signed form — `stream`, `change`, `author`,
+/// `files` in order with `sig` excluded — the JSON half of the
+/// `flint-manifest-v1` signature preimage (`docs/flint-blobs-spec.md` §5).
+pub fn writeManifestCanonical(w: *std.Io.Writer, m: *const Manifest) std.Io.Writer.Error!void {
+    try w.writeAll("{\"stream\":");
+    try writeGoJsonString(w, m.stream);
+    try w.writeAll(",\"change\":");
+    try writeGoJsonString(w, m.change);
+    try w.writeAll(",\"author\":");
+    try writeGoJsonString(w, m.author);
+    try w.writeAll(",\"files\":[");
+    for (m.files, 0..) |f, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeManifestFile(w, f);
+    }
+    try w.writeAll("]}");
+}
+
+/// Writes a complete signed manifest line in Go field order (`sig` last,
+/// inside the object), matching `marshalChangeLine`'s trailing-newline
+/// convention.
+pub fn marshalManifestLine(allocator: Allocator, m: *const Manifest) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    aw.writer.writeAll("{\"stream\":") catch return error.OutOfMemory;
+    writeGoJsonString(&aw.writer, m.stream) catch return error.OutOfMemory;
+    aw.writer.writeAll(",\"change\":") catch return error.OutOfMemory;
+    writeGoJsonString(&aw.writer, m.change) catch return error.OutOfMemory;
+    aw.writer.writeAll(",\"author\":") catch return error.OutOfMemory;
+    writeGoJsonString(&aw.writer, m.author) catch return error.OutOfMemory;
+    aw.writer.writeAll(",\"files\":[") catch return error.OutOfMemory;
+    for (m.files, 0..) |f, i| {
+        if (i > 0) aw.writer.writeByte(',') catch return error.OutOfMemory;
+        writeManifestFile(&aw.writer, f) catch return error.OutOfMemory;
+    }
+    aw.writer.writeAll("],\"sig\":") catch return error.OutOfMemory;
+    writeGoJsonString(&aw.writer, m.sig) catch return error.OutOfMemory;
+    aw.writer.writeAll("}\n") catch return error.OutOfMemory;
     return aw.toOwnedSlice();
 }
 
@@ -414,6 +473,84 @@ pub fn parseChangeFromValue(allocator: Allocator, val: std.json.Value) ParseErro
         .message = msg_copy,
         .ops = ops_copy,
         .merged = merged_copy,
+        .sig = sig_copy,
+    };
+}
+
+/// Parses one `files` entry of a manifest line. Field presence and value
+/// shape only — semantic rules (normalized paths, sorted order, reason
+/// pairing) live in `manifest.parseManifestLine`.
+pub fn parseManifestFileFromValue(allocator: Allocator, val: std.json.Value) ParseError!ManifestFile {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => return error.ChangeMalformed,
+    };
+    const path_raw = getOptString(obj, "path") orelse return error.ChangeMalformed;
+    const blob_raw = getNullableString(obj, "blob") catch return error.ChangeMalformed;
+    const reason_raw = getNullableString(obj, "reason") catch return error.ChangeMalformed;
+    const bytes_i64 = getOptInt(obj, "bytes") orelse return error.ChangeMalformed;
+    const mode_i64 = getOptInt(obj, "mode") orelse return error.ChangeMalformed;
+    if (bytes_i64 < 0) return error.ChangeMalformed;
+    if (mode_i64 < 0 or mode_i64 > std.math.maxInt(u32)) return error.ChangeMalformed;
+
+    const path_copy = try allocator.dupe(u8, path_raw);
+    errdefer allocator.free(path_copy);
+    const blob_copy = if (blob_raw) |b| try allocator.dupe(u8, b) else null;
+    errdefer if (blob_copy) |b| allocator.free(b);
+    const reason_copy = if (reason_raw) |r| try allocator.dupe(u8, r) else null;
+
+    return .{
+        .path = path_copy,
+        .blob = blob_copy,
+        .bytes = @intCast(bytes_i64),
+        .mode = @intCast(mode_i64),
+        .reason = reason_copy,
+    };
+}
+
+/// Parses a signed manifest line's JSON shape into a `Manifest`. Semantic
+/// validation (path normalization, sorted `files`, `reason` pairing, hex
+/// lengths) lives in `manifest.parseManifestLine`.
+pub fn parseManifestFromValue(allocator: Allocator, val: std.json.Value) ParseError!Manifest {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => return error.ChangeMalformed,
+    };
+    const stream_raw = getOptString(obj, "stream") orelse return error.ChangeMalformed;
+    const change_raw = getOptString(obj, "change") orelse return error.ChangeMalformed;
+    const author_raw = getOptString(obj, "author") orelse return error.ChangeMalformed;
+    const sig_raw = getOptString(obj, "sig") orelse return error.ChangeMalformed;
+
+    const files_val = obj.get("files") orelse return error.ChangeMalformed;
+    const files_arr = switch (files_val) {
+        .array => |arr| arr.items,
+        else => return error.ChangeMalformed,
+    };
+
+    const stream_copy = try allocator.dupe(u8, stream_raw);
+    errdefer allocator.free(stream_copy);
+    const change_copy = try allocator.dupe(u8, change_raw);
+    errdefer allocator.free(change_copy);
+    const author_copy = try allocator.dupe(u8, author_raw);
+    errdefer allocator.free(author_copy);
+
+    const files_copy = try allocator.alloc(ManifestFile, files_arr.len);
+    var initialized_files: usize = 0;
+    errdefer {
+        for (files_copy[0..initialized_files]) |*f| f.deinit(allocator);
+        allocator.free(files_copy);
+    }
+    for (files_arr, 0..) |f_val, i| {
+        files_copy[i] = try parseManifestFileFromValue(allocator, f_val);
+        initialized_files += 1;
+    }
+
+    const sig_copy = try allocator.dupe(u8, sig_raw);
+    return .{
+        .stream = stream_copy,
+        .change = change_copy,
+        .author = author_copy,
+        .files = files_copy,
         .sig = sig_copy,
     };
 }

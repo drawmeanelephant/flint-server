@@ -4,6 +4,7 @@ const Io = std.Io;
 const store = @import("store.zig");
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
+const content_ops = @import("content_ops.zig");
 const auth = @import("auth.zig");
 const logging = @import("logging.zig");
 const RefusalCode = store.RefusalCode;
@@ -12,7 +13,7 @@ const Stream = store.Stream;
 /// Protocol-visible spec revision, kept in lockstep with the repo-root
 /// SPECREV file by tools/tests/test_specrev.py (docs/spec-versioning.md).
 /// Announced in `hello` ok replies.
-pub const SpecRev: u32 = 3;
+pub const SpecRev: u32 = 4;
 
 pub const Session = struct {
     root_path: []const u8,
@@ -40,7 +41,7 @@ pub fn writeRefusal(
     try w.writeAll("}\n");
 }
 
-fn writeStoreErrorRefusal(w: *Io.Writer, seq: u64, err: storeio.StoreError) Io.Writer.Error!void {
+pub fn writeStoreErrorRefusal(w: *Io.Writer, seq: u64, err: storeio.StoreError) Io.Writer.Error!void {
     const info = storeio.refusalForError(err);
     try writeRefusal(w, seq, info.code, info.detail);
 }
@@ -152,6 +153,14 @@ pub fn handleLine(
         try handleAppend(io, allocator, session, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "deposit")) {
         try handleDeposit(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "put_manifest")) {
+        try content_ops.handlePutManifest(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "get_manifest")) {
+        try content_ops.handleGetManifest(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "blob_put")) {
+        try content_ops.handleBlobPut(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "blob_get")) {
+        try content_ops.handleBlobGet(io, allocator, session, obj, seq_val, w);
     } else {
         try writeRefusal(w, seq_val, .usage, "unknown op");
     }

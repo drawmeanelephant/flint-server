@@ -1,6 +1,6 @@
 # Golden transcript: unauthenticated verb refused with auth_required; bad HMAC refused with auth_failed
 > {"op":"hello","seq":1,"proto":"FLINT-SYNC/1"}
-< {"seq":1,"ok":true,"proto":"FLINT-SYNC/1","server":"flintd","nonce":"000102030405060708090a0b0c0d0e0f","spec_rev":3}
+< {"seq":1,"ok":true,"proto":"FLINT-SYNC/1","server":"flintd","nonce":"000102030405060708090a0b0c0d0e0f","spec_rev":4}
 > {"op":"list","seq":2}
 < {"seq":2,"ok":false,"refuse":"auth_required","detail":"authentication required"}
 > {"op":"auth","seq":3,"nonce":"000102030405060708090a0b0c0d0e0f","hmac":"0000000000000000000000000000000000000000000000000000000000000000"}
