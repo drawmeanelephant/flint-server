@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const store = @import("store.zig");
+const storeio = @import("storeio.zig");
+const index_cache = @import("index_cache.zig");
 const proto = @import("proto.zig");
 const logging = @import("logging.zig");
 
@@ -11,6 +13,8 @@ pub const ServeConfig = struct {
     allow_authors: ?[]const [64]u8 = null,
     fixed_nonce: ?[16]u8 = null,
     log_requests: bool = false,
+    /// Shared store-index memo (#46); null gives each session its own.
+    index_cache: ?*index_cache.IndexCache = null,
 };
 
 /// Serves a single NDJSON session reading lines from `reader` and writing responses to `writer`.
@@ -21,11 +25,15 @@ pub fn serveStream(
     reader: *Io.Reader,
     writer: *Io.Writer,
 ) !void {
+    var local_index: index_cache.IndexCache = .{};
+    defer local_index.deinit(allocator);
+
     var session = proto.Session{
         .root_path = cfg.root_path,
         .auth_key = cfg.auth_key,
         .allow_authors = cfg.allow_authors,
         .fixed_nonce = cfg.fixed_nonce,
+        .index_cache = cfg.index_cache orelse &local_index,
     };
     var connection: [16]u8 = undefined;
     if (cfg.log_requests) io.random(&connection);
@@ -242,6 +250,12 @@ pub fn serveTcp(
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    // One index memo shared across the serialized accept loop (#46).
+    var shared_index: index_cache.IndexCache = .{};
+    defer shared_index.deinit(allocator);
+    var tcp_cfg = cfg;
+    tcp_cfg.index_cache = &shared_index;
+
     var stderr_buf: [256]u8 = undefined;
     var stderr_w = Io.File.stderr().writerStreaming(io, &stderr_buf);
     try stderr_w.interface.print("flintd: listening {f}\n", .{server.socket.address});
@@ -266,7 +280,7 @@ pub fn serveTcp(
         var timed_r = TimedReader.init(stream, io, &r_buf, read_timeout);
         var net_w = stream.writer(io, &w_buf);
 
-        serveStream(io, allocator, cfg, &timed_r.interface, &net_w.interface) catch |err| {
+        serveStream(io, allocator, tcp_cfg, &timed_r.interface, &net_w.interface) catch |err| {
             const timed_out = if (timed_r.err) |e| e == error.Timeout else false;
             const reason: []const u8 = if (timed_out) "idle_timeout" else @errorName(err);
             stderr_w.interface.print("flintd: disconnect {f} reason={s}\n", .{ stream.socket.address, reason }) catch {};
@@ -283,7 +297,6 @@ pub fn serveTcp(
 test "TimedReader: idle peer surfaces Timeout and ends the session" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const storeio = @import("storeio.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -320,7 +333,6 @@ test "TimedReader: idle peer surfaces Timeout and ends the session" {
 test "TimedReader: active peer is served normally before the deadline" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const storeio = @import("storeio.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

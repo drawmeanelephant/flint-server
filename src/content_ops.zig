@@ -4,6 +4,7 @@ const Io = std.Io;
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
 const contentio = @import("contentio.zig");
+const index_cache = @import("index_cache.zig");
 const proto = @import("proto.zig");
 
 const Session = proto.Session;
@@ -120,11 +121,12 @@ pub fn handleGetManifest(
         }
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    var scratch_index: index_cache.IndexCache = .{};
+    defer scratch_index.deinit(allocator);
+    const idx = proto.sessionIndex(io, allocator, session, &scratch_index) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found_st = idx.findById(stream_arg) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");

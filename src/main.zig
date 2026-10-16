@@ -288,5 +288,7 @@ test {
     _ = @import("blobs_test.zig");
     _ = @import("contentio.zig");
     _ = @import("content_ops.zig");
+    _ = @import("index_cache.zig");
+    _ = @import("index_cache_test.zig");
     _ = @import("conformance_test.zig");
 }

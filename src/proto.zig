@@ -4,6 +4,7 @@ const Io = std.Io;
 const store = @import("store.zig");
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
+const index_cache = @import("index_cache.zig");
 const content_ops = @import("content_ops.zig");
 const auth = @import("auth.zig");
 const logging = @import("logging.zig");
@@ -26,7 +27,20 @@ pub const Session = struct {
     close_after_reply: bool = false,
     request_seq: ?u32 = null,
     request_op: logging.Operation = .unknown,
+    /// Shared store-index memo (#46); null falls back to a per-request load.
+    index_cache: ?*index_cache.IndexCache = null,
 };
+
+/// Returns the session's index cache, or a stack-local scratch cache so
+/// uncached callers keep the previous load-per-request behavior.
+pub fn sessionIndex(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    scratch: *index_cache.IndexCache,
+) storeio.StoreError!*const storeio.StoreIndex {
+    return (session.index_cache orelse scratch).get(io, allocator, session.root_path);
+}
 
 pub fn writeRefusal(
     w: *Io.Writer,
@@ -278,11 +292,12 @@ fn handleList(
     seq: u64,
     w: *Io.Writer,
 ) Io.Writer.Error!void {
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    var scratch_index: index_cache.IndexCache = .{};
+    defer scratch_index.deinit(allocator);
+    const idx = sessionIndex(io, allocator, session, &scratch_index) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     try w.print("{{\"seq\":{d},\"ok\":true,\"streams\":[", .{seq});
     for (idx.streams, 0..) |st, i| {
@@ -303,17 +318,21 @@ fn handleHeads(
     seq: u64,
     w: *Io.Writer,
 ) Io.Writer.Error!void {
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    var scratch_index: index_cache.IndexCache = .{};
+    defer scratch_index.deinit(allocator);
+    const idx = sessionIndex(io, allocator, session, &scratch_index) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     // Sort by stream id so the JSON object keys are emitted in canonical order.
-    std.mem.sort(Stream, idx.streams, {}, streamByIdLessThan);
+    // The cached index must not be mutated, so sort a copy.
+    const sorted = allocator.dupe(Stream, idx.streams) catch return error.WriteFailed;
+    defer allocator.free(sorted);
+    std.mem.sort(Stream, sorted, {}, streamByIdLessThan);
 
     try w.print("{{\"seq\":{d},\"ok\":true,\"heads\":{{", .{seq});
-    for (idx.streams, 0..) |st, i| {
+    for (sorted, 0..) |st, i| {
         if (i > 0) try w.writeByte(',');
         try json.writeGoJsonString(w, st.id);
         try w.writeByte(':');
@@ -346,11 +365,12 @@ fn handleOpen(
         return;
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    var scratch_index: index_cache.IndexCache = .{};
+    defer scratch_index.deinit(allocator);
+    const idx = sessionIndex(io, allocator, session, &scratch_index) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found = idx.findByNameOrId(req_stream) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
@@ -419,11 +439,12 @@ fn handleRead(
         }
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    var scratch_index: index_cache.IndexCache = .{};
+    defer scratch_index.deinit(allocator);
+    const idx = sessionIndex(io, allocator, session, &scratch_index) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found_st = idx.findById(stream_arg) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
