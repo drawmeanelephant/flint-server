@@ -8,6 +8,13 @@ reports/
 __pycache__/
 *.py[cod]
 
+# Boris documentation site
+docs/site/dist/
+docs/site/.boris-cache/
+docs/site/.pages-profile.json
+docs/site/evidence/
+docs/site/public-site/
+
 # Local configuration and secrets, never the documented template
 .env
 .env.*
