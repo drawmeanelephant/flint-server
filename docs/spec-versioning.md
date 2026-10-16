@@ -58,6 +58,7 @@ makes several protocol-visible changes still bumps once.
 | Rev | Change | Ref |
 |---|---|---|
 | 1 | `SPECREV` convention; `hello` ok replies announce `spec_rev` | [#34](https://github.com/drawmeanelephant/flint-server/issues/34) |
+| 2 | `store_io` refusal name for store filesystem failures (was `stream_malformed`) | [#36](https://github.com/drawmeanelephant/flint-server/issues/36) |
 
 ## 3. The `hello` `spec_rev` field
 

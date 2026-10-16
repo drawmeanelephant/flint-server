@@ -601,3 +601,185 @@ test "request metadata resets on malformed input and never stores arbitrary oper
     try std.testing.expectEqual(@as(?u32, null), session.request_seq);
     try std.testing.expectEqual(.unknown, session.request_op);
 }
+
+fn expectFileBytes(path: []const u8, expected: []const u8) !void {
+    const bytes = try storeio.readFileBounded(std.testing.io, std.testing.allocator, path, store.MaxFileReadBytes);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(expected, bytes);
+}
+
+test "storage boundary: crash cuts recover complete batches but never truncate torn bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const raw = try storeio.readFileBounded(io, a, "testdata/sync/push_pull.ndjson", store.MaxFileReadBytes);
+    defer a.free(raw);
+    var changes: ?std.json.Parsed(std.json.Value) = null;
+    defer if (changes) |*p| p.deinit();
+    var transcript = std.mem.splitScalar(u8, raw, '\n');
+    while (transcript.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "> ") or std.mem.indexOf(u8, line, "\"op\":\"append\"") == null) continue;
+        changes = try std.json.parseFromSlice(std.json.Value, a, line[2..], .{});
+        break;
+    }
+    const lines = changes.?.value.object.get("changes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    var first = try change.parseChange(a, lines[0].string);
+    defer first.deinit(a);
+    var last = try change.parseChange(a, lines[1].string);
+    defer last.deinit(a);
+    const batch = try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ lines[0].string, lines[1].string });
+    defer a.free(batch);
+
+    // Durable append, interrupted metadata publication, and a second recovery.
+    for ([_]?[]const u8{ null, first.id, last.id }) |head| {
+        var ts = try TempStore.init(a);
+        defer ts.deinit(a);
+        const record_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.json", .{ ts.root_path, first.stream });
+        defer a.free(record_path);
+        const log_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.jsonl", .{ ts.root_path, first.stream });
+        defer a.free(log_path);
+        const tmp_path = try std.fmt.allocPrint(a, "{s}.tmp-abandoned", .{record_path});
+        defer a.free(tmp_path);
+        const record_bytes = try json.marshalStreamRecord(a, .{
+            .id = first.stream,
+            .name = "main",
+            .head = head,
+            .created = first.ts,
+        });
+        defer a.free(record_bytes);
+        try storeio.writeFileSafe(io, a, record_path, record_bytes);
+        try storeio.appendSync(io, log_path, batch);
+        try storeio.appendSync(io, tmp_path, "{\"head\":\"unfinished");
+
+        for (0..2) |_| {
+            var idx = try storeio.loadStoreIndex(io, a, ts.root_path);
+            defer idx.deinit(a);
+            try std.testing.expectEqualStrings(last.id, idx.streams[0].head.?);
+            var loaded = try storeio.loadStream(io, a, ts.root_path, first.stream);
+            defer loaded.deinit(a);
+            try std.testing.expectEqual(@as(usize, 2), loaded.changes.len);
+            try std.testing.expectEqualStrings(last.id, loaded.stream.head.?);
+            try expectFileBytes(log_path, batch);
+            try expectFileBytes(tmp_path, "{\"head\":\"unfinished");
+        }
+    }
+
+    // These are process-crash disk images, not power-loss simulation. Even a
+    // complete JSON object without its final newline must remain stream_torn.
+    for ([_]usize{ 1, lines[1].string.len / 2, lines[1].string.len }) |cut| {
+        var ts = try TempStore.init(a);
+        defer ts.deinit(a);
+        try storeio.createStream(io, a, ts.root_path, .{ .id = first.stream, .name = "main", .created = first.ts });
+        const head = try storeio.appendStreamChanges(io, a, ts.root_path, first.stream, null, &.{lines[0].string}, null);
+        defer if (head) |h| a.free(h);
+        const record_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.json", .{ ts.root_path, first.stream });
+        defer a.free(record_path);
+        const log_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.jsonl", .{ ts.root_path, first.stream });
+        defer a.free(log_path);
+        const before = try storeio.readFileBounded(io, a, record_path, store.MaxFileReadBytes);
+        defer a.free(before);
+        const torn = try std.fmt.allocPrint(a, "{s}\n{s}", .{ lines[0].string, lines[1].string[0..cut] });
+        defer a.free(torn);
+        try storeio.writeFileSafe(io, a, log_path, torn);
+        try std.testing.expectError(error.StreamTorn, storeio.loadStoreIndex(io, a, ts.root_path));
+        try std.testing.expectError(error.StreamTorn, storeio.loadStream(io, a, ts.root_path, first.stream));
+        try expectFileBytes(record_path, before);
+        try expectFileBytes(log_path, torn);
+    }
+}
+
+test "storage boundary: exactly 4 MiB is readable and the next append changes no bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var ts = try TempStore.init(a);
+    defer ts.deinit(a);
+    const stream_id = "01928374-0000-7000-8000-000000000000";
+    const c1 = "01928374-0000-7000-8000-000000000001";
+    const c2 = "01928374-0000-7000-8000-000000000002";
+    const c3 = "01928374-0000-7000-8000-000000000003";
+    const seed: [32]u8 = @splat(0x42);
+    const first = try makeSignedChangeLine(a, seed, c1, null, stream_id, 1, "first", &.{}, null);
+    defer a.free(first);
+    const second = try makeSignedChangeLine(a, seed, c2, c1, stream_id, 2, "second", &.{}, null);
+    defer a.free(second);
+    const third = try makeSignedChangeLine(a, seed, c3, c2, stream_id, 3, "third", &.{}, null);
+    defer a.free(third);
+    try storeio.createStream(io, a, ts.root_path, .{ .id = stream_id, .name = "main", .created = 1 });
+
+    // JSON whitespace is not signed. Use it to reach the exact byte boundary
+    // with valid signatures, without an oversized message or thousands of Ops.
+    const padded = try a.alloc(u8, store.MaxFileReadBytes - second.len - 2);
+    defer a.free(padded);
+    @memcpy(padded[0..first.len], first);
+    @memset(padded[first.len..], ' ');
+    const h1 = try storeio.appendStreamChanges(io, a, ts.root_path, stream_id, null, &.{padded}, null);
+    defer if (h1) |h| a.free(h);
+    const h2 = try storeio.appendStreamChanges(io, a, ts.root_path, stream_id, c1, &.{second}, null);
+    defer if (h2) |h| a.free(h);
+    try std.testing.expectEqualStrings(c2, h2.?);
+    const log_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.jsonl", .{ ts.root_path, stream_id });
+    defer a.free(log_path);
+    const record_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.json", .{ ts.root_path, stream_id });
+    defer a.free(record_path);
+    const log_before = try storeio.readFileBounded(io, a, log_path, store.MaxFileReadBytes);
+    defer a.free(log_before);
+    const record_before = try storeio.readFileBounded(io, a, record_path, store.MaxFileReadBytes);
+    defer a.free(record_before);
+    try std.testing.expectEqual(store.MaxFileReadBytes, log_before.len);
+    var loaded = try storeio.loadStream(io, a, ts.root_path, stream_id);
+    defer loaded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), loaded.changes.len);
+    try std.testing.expectError(error.StoreTooLarge, storeio.appendStreamChanges(io, a, ts.root_path, stream_id, c2, &.{third}, null));
+    try expectFileBytes(log_path, log_before);
+    try expectFileBytes(record_path, record_before);
+}
+
+test "storage boundary: 4096 signed Changes fit and the next append is atomic refusal" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var ts = try TempStore.init(a);
+    defer ts.deinit(a);
+    const stream_id = "01928374-0000-7000-8000-000000000000";
+    const seed: [32]u8 = @splat(0x42);
+    try storeio.createStream(io, a, ts.root_path, .{ .id = stream_id, .name = "main", .created = 1 });
+    const log_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.jsonl", .{ ts.root_path, stream_id });
+    defer a.free(log_path);
+    const record_path = try std.fmt.allocPrint(a, "{s}/streams/{s}.json", .{ ts.root_path, stream_id });
+    defer a.free(record_path);
+    var history: Io.Writer.Allocating = .init(a);
+    defer history.deinit();
+    var parent: ?[]u8 = null;
+    defer if (parent) |p| a.free(p);
+    for (1..store.MaxChanges) |i| {
+        const id = try std.fmt.allocPrint(a, "01928374-0000-7000-8000-{x:0>12}", .{i});
+        errdefer a.free(id);
+        const line = try makeSignedChangeLine(a, seed, id, parent, stream_id, @intCast(i), "capacity", &.{}, null);
+        defer a.free(line);
+        try history.writer.print("{s}\n", .{line});
+        if (parent) |p| a.free(p);
+        parent = id;
+    }
+    try storeio.appendSync(io, log_path, history.written());
+    // Publish the fixture's head so the test measures append, not recovery.
+    const record_bytes = try json.marshalStreamRecord(a, .{ .id = stream_id, .name = "main", .head = parent, .created = 1 });
+    defer a.free(record_bytes);
+    try storeio.writeFileSafe(io, a, record_path, record_bytes);
+    const final_id = "01928374-0000-7000-8000-000000001000";
+    const final = try makeSignedChangeLine(a, seed, final_id, parent, stream_id, 4096, "last slot", &.{}, null);
+    defer a.free(final);
+    const head = try storeio.appendStreamChanges(io, a, ts.root_path, stream_id, parent, &.{final}, null);
+    defer if (head) |h| a.free(h);
+    try std.testing.expectEqualStrings(final_id, head.?);
+    var idx = try storeio.loadStoreIndex(io, a, ts.root_path);
+    defer idx.deinit(a);
+    try std.testing.expectEqual(store.MaxChanges, idx.total_changes);
+    const extra = try makeSignedChangeLine(a, seed, "01928374-0000-7000-8000-000000001001", final_id, stream_id, 4097, "overflow", &.{}, null);
+    defer a.free(extra);
+    const log_before = try storeio.readFileBounded(io, a, log_path, store.MaxFileReadBytes);
+    defer a.free(log_before);
+    const record_before = try storeio.readFileBounded(io, a, record_path, store.MaxFileReadBytes);
+    defer a.free(record_before);
+    try std.testing.expectError(error.StoreTooLarge, storeio.appendStreamChanges(io, a, ts.root_path, stream_id, final_id, &.{extra}, null));
+    try expectFileBytes(log_path, log_before);
+    try expectFileBytes(record_path, record_before);
+}
