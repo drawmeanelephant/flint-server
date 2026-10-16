@@ -85,6 +85,12 @@
       "required": ["op", "stream", "changes"],
       "properties": {"op": {"const": "append"}, "stream": {"type": "string", "minLength": 1}, "expected_head": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "changes": {"type": "array", "minItems": 1, "items": {"type": "string"}}}
     },
+    "deposit": {
+      "description": "Append detached signed Change lines without moving the head; 1-256 per request, idempotent by Change id. Change strings are raw JSONL bytes without the final newline.",
+      "type": "object",
+      "required": ["op", "stream", "changes"],
+      "properties": {"op": {"const": "deposit"}, "stream": {"type": "string", "minLength": 1}, "changes": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}}}
+    },
     "request": {
       "allOf": [
         {"$ref": "#/$defs/envelope"},
@@ -92,7 +98,8 @@
           {"$ref": "#/$defs/hello"}, {"$ref": "#/$defs/auth"},
           {"$ref": "#/$defs/list"}, {"$ref": "#/$defs/heads"},
           {"$ref": "#/$defs/open"}, {"$ref": "#/$defs/read"},
-          {"$ref": "#/$defs/create"}, {"$ref": "#/$defs/append"}
+          {"$ref": "#/$defs/create"}, {"$ref": "#/$defs/append"},
+          {"$ref": "#/$defs/deposit"}
         ]}
       ]
     },
@@ -111,6 +118,7 @@
         "heads": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nullableUuid"}},
         "head": {"$ref": "#/$defs/nullableUuid"},
         "changes": {"type": "array", "items": {"type": "string"}},
+        "stored": {"type": "integer", "minimum": 0},
         "more": {"type": "boolean"},
         "refuse": {"type": "string", "enum": ["stream_missing", "stream_exists", "stale_head", "change_malformed", "change_missing", "sig_invalid", "store_too_large", "stream_malformed", "stream_torn", "message_invalid", "usage", "proto_version", "auth_required", "auth_failed", "author_not_allowed", "store_not_found", "store_missing", "store_io"]},
         "detail": {"type": "string"}

@@ -219,7 +219,7 @@ test "M106a & M106b: initStore, stream record round-trip, roll-forward, torn str
     };
     try storeio.createStream(io, allocator, ts.root_path, st);
 
-    // §2.4: createStream writes streams/<id>.json only; .jsonl is created lazily by the first append.
+    // §2.5: createStream writes streams/<id>.json only; .jsonl is created lazily by the first append.
     const jsonl_path = try std.fmt.allocPrint(allocator, "{s}/streams/{s}.jsonl", .{ ts.root_path, stream_id });
     defer allocator.free(jsonl_path);
     try std.testing.expect(!storeio.fileExists(io, jsonl_path));
@@ -331,6 +331,14 @@ test "M106c & M106f: golden transcript push_pull.ndjson" {
     defer ts.deinit(allocator);
 
     try replayTranscript(allocator, .{ .root_path = ts.root_path }, "testdata/sync/push_pull.ndjson");
+}
+
+test "M106f: golden transcript deposit.ndjson — detached lines, idempotent resend, head untouched" {
+    const allocator = std.testing.allocator;
+    var ts = try TempStore.init(allocator);
+    defer ts.deinit(allocator);
+
+    try replayTranscript(allocator, .{ .root_path = ts.root_path }, "testdata/sync/deposit.ndjson");
 }
 
 test "M106d & M106f: golden transcript auth_refuse.ndjson and successful HMAC auth + allowlist files" {
@@ -517,7 +525,7 @@ test "M106f: two-client sync journey, fork validation, and client/server store p
     try std.testing.expectEqual(@as(usize, 2), idx.streams.len);
     try std.testing.expectEqual(@as(usize, 3), idx.total_changes);
 
-    // 5. Multi-hop fork chain resolution (§2.4):
+    // 5. Multi-hop fork chain resolution (§2.5):
     // fork_id ("feat") was forked from main@c2_id. Append c4 on feat, then create fork2 ("subfeat")
     // pointing its forked_from at {stream: fork_id, change: c1_id} where c1_id lives in grandparent main
     // before the c2_id fork cutoff.
@@ -554,6 +562,83 @@ test "M106f: two-client sync journey, fork validation, and client/server store p
         error.ChangeMalformed,
         storeio.appendStreamChanges(io, allocator, ts.root_path, main_id, c3_id, &.{}, null),
     );
+}
+
+test "spec_rev 3: deposit transfers preserved ancestry so a recovery fork can create" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ts = try TempStore.init(allocator);
+    defer ts.deinit(allocator);
+
+    const seed: [32]u8 = @splat(0x42);
+    const main_id = "01928374-0000-7000-8000-000000000000";
+    const c1_id = "01928374-0000-7000-8000-000000000001";
+    const c2_id = "01928374-0000-7000-8000-000000000002";
+    // A preserved original: a divergent Change on main that never became head.
+    const orig_id = "01928374-0000-7000-8000-0000000000aa";
+    const fork_id = "01928374-0000-7000-8000-000000000099";
+
+    try storeio.createStream(io, allocator, ts.root_path, .{
+        .id = main_id,
+        .name = "main",
+        .created = 1700000000,
+    });
+    const c1_line = try makeSignedChangeLine(allocator, seed, c1_id, null, main_id, 1700000001, "c1", &.{}, null);
+    defer allocator.free(c1_line);
+    const c2_line = try makeSignedChangeLine(allocator, seed, c2_id, c1_id, main_id, 1700000002, "c2", &.{}, null);
+    defer allocator.free(c2_line);
+    const nh = try storeio.appendStreamChanges(io, allocator, ts.root_path, main_id, null, &.{ c1_line, c2_line }, null);
+    defer if (nh) |h| allocator.free(h);
+
+    const orig_line = try makeSignedChangeLine(allocator, seed, orig_id, c1_id, main_id, 1700000003, "preserved original", &.{}, null);
+    defer allocator.free(orig_line);
+
+    // Before the deposit, a fork naming the preserved change cannot resolve it.
+    try std.testing.expectError(error.ChangeMissing, storeio.createStream(io, allocator, ts.root_path, .{
+        .id = fork_id,
+        .name = "recovery",
+        .head = orig_id,
+        .created = 1700000004,
+        .forked_from = .{ .stream = main_id, .change = orig_id },
+    }));
+
+    // deposit carries the original bytes onto the origin stream; head stays c2.
+    const res = try storeio.depositStreamChanges(io, allocator, ts.root_path, main_id, &.{orig_line}, null);
+    defer if (res.head) |h| allocator.free(h);
+    try std.testing.expectEqual(@as(usize, 1), res.stored);
+    try std.testing.expectEqualStrings(c2_id, res.head.?);
+
+    // Now the same fork record resolves and the original is retrievable by read.
+    try storeio.createStream(io, allocator, ts.root_path, .{
+        .id = fork_id,
+        .name = "recovery",
+        .head = orig_id,
+        .created = 1700000004,
+        .forked_from = .{ .stream = main_id, .change = orig_id },
+    });
+
+    var loaded = try storeio.loadStream(io, allocator, ts.root_path, main_id);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqualStrings(c2_id, loaded.stream.head.?);
+    try std.testing.expectEqual(@as(usize, 3), loaded.changes.len);
+    try std.testing.expectEqualStrings(orig_id, loaded.changes[2].id);
+    try std.testing.expectEqualStrings(orig_line, loaded.raw_lines[2]);
+
+    // A deposited line anchors detached ancestry on a fork whose head moved on:
+    // the fork's `forked_from.change` is a valid detached parent.
+    const f1_id = "01928374-0000-7000-8000-000000000005";
+    const aside_id = "01928374-0000-7000-8000-000000000006";
+    const f1_line = try makeSignedChangeLine(allocator, seed, f1_id, orig_id, fork_id, 1700000005, "fork work", &.{}, null);
+    defer allocator.free(f1_line);
+    const fh = try storeio.appendStreamChanges(io, allocator, ts.root_path, fork_id, orig_id, &.{f1_line}, null);
+    defer if (fh) |h| allocator.free(h);
+    const aside_line = try makeSignedChangeLine(allocator, seed, aside_id, orig_id, fork_id, 1700000006, "detached on fork", &.{}, null);
+    defer allocator.free(aside_line);
+    const res2 = try storeio.depositStreamChanges(io, allocator, ts.root_path, fork_id, &.{aside_line}, null);
+    defer if (res2.head) |h| allocator.free(h);
+    try std.testing.expectEqual(@as(usize, 1), res2.stored);
+    try std.testing.expectEqualStrings(f1_id, res2.head.?);
 }
 
 test "M106c: bounded line reader refuses >4 MiB unterminated line with store_too_large" {

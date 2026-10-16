@@ -65,7 +65,7 @@ client-end vision end to end.
 ## 3. Server gap analysis
 
 "Today" = the §2.2 verb table (`hello`, `auth`, `list`, `heads`,
-`open`, `read`, `create`, `append`) plus `--listen` / `--stdio` /
+`open`, `read`, `create`, `append`, `deposit`) plus `--listen` / `--stdio` /
 `--auth-key` / `--allow-author` / `--read-timeout` — and a latent
 `max_conns` param on `serveTcp` (`main.zig` passes `null`; no flag
 exposes it).

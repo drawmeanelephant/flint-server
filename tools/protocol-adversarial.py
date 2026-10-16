@@ -26,6 +26,15 @@ PROTO = "FLINT-SYNC/1"
 STREAM = "0199de2d-dc00-7000-8000-000000000010"
 RESULTS = []
 
+# Signed Changes on STREAM for the deposit checks (spec_rev 3, issue #40):
+# DETACHED roots at the first pinned change, DETACHED_CHILD roots at DETACHED,
+# EXTENDS_HEAD parents the head the pinned append batch produces, and ORPHAN
+# names an id nobody holds. All verify under the pinned vector key.
+DETACHED = '{"id":"0199de2d-dc00-7000-8000-000000000102","parent":"0199de2d-dc00-7000-8000-000000000100","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000002000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"preserved recovery original","ops":[],"merged":null,"sig":"0576aa4b885bc6bb20bd26a6cacbf686a7f2914bd9ebd637af8527f0d463dc620187624effdc3eebe1393e94e1186aa54d8934e5d60437322dcced51886fe20f"}'
+EXTENDS_HEAD = '{"id":"0199de2d-dc00-7000-8000-000000000103","parent":"0199de2d-dc00-7000-8000-000000000101","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000003000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"looks like an append","ops":[],"merged":null,"sig":"e1126add21199e066fcd29cfc857f5a69c56913321b4415ea9a6a2b31cdc5abaffdf664f8fd140fea818b36cf5c313f80b36cdd55623aa09e8bf8780abf3dd0c"}'
+ORPHAN = '{"id":"0199de2d-dc00-7000-8000-000000000104","parent":"0199de2d-dc00-7000-8000-00000000ffff","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000004000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"orphan parent","ops":[],"merged":null,"sig":"319e99a18317a0f22d5a1906832a7e7c4f8d5df13e6855448e13d4320de5a721a353d8a4622c6aa8501b247e82ca8cf18748f2eb2b4a5371edd68b7268810e04"}'
+DETACHED_CHILD = '{"id":"0199de2d-dc00-7000-8000-000000000105","parent":"0199de2d-dc00-7000-8000-000000000102","stream":"0199de2d-dc00-7000-8000-000000000010","ts":1760000005000,"author":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","message":"child of detached","ops":[],"merged":null,"sig":"5a864337aa1f288c43909d4b2fc1df9e1fd5e4ab2fc4a8132b885c49f9c8980c827b82aaeef987b02592155ffc6fbd6e7dcc8daa3835fcf9755a4271f8f07603"}'
+
 
 def load_vectors():
     changes = []
@@ -413,6 +422,64 @@ def test_fork_chain(port, changes, head):
     c.close()
 
 
+def test_deposit(port, changes, head):
+    """spec_rev 3 deposit op: detached lines land without moving the head,
+    resends are idempotent, and every abuse case refuses by name."""
+    c = hello(port)
+    base = {"op": "deposit", "stream": STREAM}
+
+    r = c.call({"op": "deposit", "seq": 1, "stream": STREAM})
+    check("deposit without changes refuses usage", refused(r, "usage"), r)
+    r = c.call({**base, "seq": 2, "changes": "nope"})
+    check("deposit with non-array changes refuses usage", refused(r, "usage"), r)
+    r = c.call({**base, "seq": 3, "changes": [42]})
+    check("deposit non-string change entry refuses", r is not None and r.get("ok") is False, r)
+    r = c.call({**base, "seq": 4, "changes": []})
+    check("deposit empty batch refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({"op": "deposit", "seq": 5, "stream": "0199de2d-dc00-7000-8000-0000000000aa",
+                "changes": [DETACHED]})
+    check("deposit on unknown stream refuses stream_missing", refused(r, "stream_missing"), r)
+
+    # A well-formed detached line whose signature fails refuses sig_invalid.
+    bad_sig = DETACHED.replace("preserved recovery original", "preserved recovery oxiginal")
+    r = c.call({**base, "seq": 6, "changes": [bad_sig]})
+    check("deposit bad signature refuses sig_invalid", refused(r, "sig_invalid"), r)
+    # Validly signed, but a detached Change may not extend the current head.
+    r = c.call({**base, "seq": 7, "changes": [EXTENDS_HEAD]})
+    check("deposit with parent=head refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({**base, "seq": 8, "changes": [ORPHAN]})
+    check("deposit with unknown parent refuses change_malformed", refused(r, "change_malformed"), r)
+    r = c.call({**base, "seq": 9, "changes": [changes[0]] * 257})
+    check("deposit batch over 256 refuses change_malformed", refused(r, "change_malformed"), r)
+
+    # Nothing refused above may have been written.
+    r = c.call({"op": "read", "seq": 10, "stream": STREAM})
+    check("refused deposits left the log untouched",
+          r.get("changes") == changes and r.get("head") == head, str(r)[:160])
+
+    # Happy path by name: a detached line stores, head echoes unchanged.
+    r = c.call({"op": "deposit", "seq": 11, "stream": "main", "changes": [DETACHED]})
+    check("deposit of a detached change stores it, head unmoved",
+          r is not None and r.get("ok") is True and r.get("stored") == 1 and r.get("head") == head, r)
+    r = c.call({**base, "seq": 12, "changes": [DETACHED]})
+    check("re-deposit of identical bytes is a no-op (stored=0)",
+          r is not None and r.get("ok") is True and r.get("stored") == 0 and r.get("head") == head, r)
+    r = c.call({**base, "seq": 13, "changes": [DETACHED + " "]})
+    check("same id under different bytes refuses change_malformed", refused(r, "change_malformed"), r)
+    # A child rooted at the just-deposited line resolves its parent in-log.
+    r = c.call({**base, "seq": 14, "changes": [DETACHED_CHILD]})
+    check("deposit child of a detached line stores",
+          r is not None and r.get("ok") is True and r.get("stored") == 1, r)
+
+    r = c.call({"op": "read", "seq": 15, "stream": STREAM})
+    check("read returns deposited detached lines verbatim",
+          r.get("changes") == changes + [DETACHED, DETACHED_CHILD] and r.get("head") == head,
+          str(r)[:160])
+    r = c.call({"op": "heads", "seq": 16})
+    check("heads still shows the pre-deposit head", r.get("heads", {}).get(STREAM) == head, r)
+    c.close()
+
+
 def test_connection_stress(port):
     # Idle connections must not block an active client.
     idle = [Conn(port) for _ in range(4)]
@@ -490,11 +557,13 @@ def test_concurrent_create_race(port):
 
 
 def test_persistence_and_recovery(store, changes, head):
+    # The deposit leg appended two detached lines; they persist verbatim too.
+    expected_lines = changes + [DETACHED, DETACHED_CHILD]
     proc, port = start(store)
     try:
         c = hello(port)
         r = c.call({"op": "read", "seq": 1, "stream": STREAM})
-        check("changes survive a server restart byte-identically", r.get("changes") == changes and r.get("head") == head, str(r)[:160])
+        check("changes survive a server restart byte-identically", r.get("changes") == expected_lines and r.get("head") == head, str(r)[:160])
         c.close()
     finally:
         stop(proc)
@@ -612,7 +681,12 @@ def test_allow_author(directory, changes):
         c.call({"op": "create", "seq": 2, "record": record()})
         r = c.call({"op": "append", "seq": 3, "stream": STREAM, "expected_head": None, "changes": changes})
         check("author outside the allowlist refuses author_not_allowed", refused(r, "author_not_allowed"), r)
-        r = c.call({"op": "read", "seq": 4, "stream": STREAM})
+        # The author gate mirrors append's order (after signature and parent
+        # checks): on an empty stream DETACHED's parent cannot resolve, so the
+        # refusal surfaces as change_malformed rather than author_not_allowed.
+        r = c.call({"op": "deposit", "seq": 4, "stream": STREAM, "changes": [DETACHED]})
+        check("deposit on a gated empty stream refuses cleanly", refused(r, "change_malformed"), r)
+        r = c.call({"op": "read", "seq": 5, "stream": STREAM})
         check("disallowed author left no log", r.get("changes") == [], r)
         c.close()
     finally:
@@ -715,6 +789,7 @@ def main():
             head = run_test(test_append_validation, port, changes)
             run_test(test_read_semantics, port, changes, head)
             run_test(test_fork_chain, port, changes, head)
+            run_test(test_deposit, port, changes, head)
             run_test(test_oversize, port)
             run_test(test_connection_stress, port)
             run_test(test_concurrent_create_race, port)

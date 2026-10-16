@@ -42,7 +42,7 @@ should serve this protocol so guest and host are interchangeable endpoints.
 - Refusal names are the ADR/Go vocabulary (`stream_missing`,
   `stream_exists`, `stale_head`, `change_malformed`, `sig_invalid`,
   `store_too_large`, `stream_malformed`, `stream_torn`,
-  `message_invalid`, `usage`, …). Wire additions are listed in §2.5 and
+  `message_invalid`, `usage`, …). Wire additions are listed in §2.6 and
   nowhere else.
 - No GPL-family code anywhere (VirelaiOS rule; carries over).
 
@@ -117,9 +117,10 @@ Refusal:
 | `read` | `stream`, `after` (optional change id), `limit` (optional, default 256, max 1024) | `record`, `head`, `changes:[<raw line>,…]`, `more` | `stream_missing`, `change_missing` (unknown `after`) |
 | `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`/`change_missing` (bad `forked_from`), `store_io` |
 | `append` | `stream` (id), `expected_head` (nullable), `changes:[<raw line>,…]` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed`, `store_io` |
+| `deposit` | `stream` (id or name), `changes:[<raw line>,…]` (1–256) | `head:<unchanged head>`, `stored:<count>` | `stream_missing`, `change_malformed`, `sig_invalid`, `message_invalid`, `author_not_allowed`, `store_too_large`, `store_io` |
 
-`stream`/`after` fields take canonical lowercase UUID strings; `open` also
-accepts a stream **name**.
+`stream`/`after` fields take canonical lowercase UUID strings; `open` and
+`deposit` also accept a stream **name**.
 
 `hello` success replies announce `spec_rev`, the server's
 protocol-visible spec revision (repo-root `SPECREV`;
@@ -161,7 +162,55 @@ Nothing is appended unless the entire batch validates. `merged` Changes
 (the merge records) ride this path unchanged — the server does not
 interpret them.
 
-### 2.4 `create` semantics
+### 2.4 `deposit` semantics — detached Change lines (spec_rev 3)
+
+A stream's `.jsonl` is append-only and may contain **detached** Change
+lines — valid signed Changes of that stream that do not sit on the
+head's first-parent chain. `deposit` appends such lines to an existing
+stream's log without moving the record head, so preserved work — the
+original signed Change behind a saved recovery fork, or any Change a
+merge's signed `merged` link names — becomes retrievable by `read`.
+No new retrieval op is needed.
+
+Request `{stream: <id-or-name>, changes: [<raw line>, …]}`; reply
+`{"ok":true,"head":<unchanged head or null>,"stored":<m>}`.
+
+For each batch on stream `S`:
+
+1. Resolve `S` → else `stream_missing`. An empty or oversize batch is
+   `change_malformed` (1–256 raw lines per request).
+2. Validate **all** Changes before appending any, mirroring §2.3:
+   `ParseChange` each raw line → `change_malformed`; `c.stream == S.id`
+   → `change_malformed`; message bounds → `message_invalid`;
+   `VerifyChange` → `sig_invalid`; `--allow-author` →
+   `author_not_allowed`. Then the detached rules:
+   - A non-duplicate Change whose `parent` equals the current head is an
+     `append`, not a deposit → `change_malformed` (`extends head`).
+   - Every deposited `parent` must otherwise be null, an id already in
+     `S`'s log, `S`'s `forked_from.change`, or an id earlier in the same
+     batch → `change_malformed` (`detached parent unknown`). Deposits
+     are therefore ancestry-complete: a stored detached Change's whole
+     first-parent ancestry back to a root or to existing log content is
+     present in the log.
+   - Dedupe by id: a byte-identical repeat is skipped and does not count
+     toward `stored`; the same id under different bytes refuses
+     `change_malformed` (`id conflict`). Deposits are idempotent — an
+     interrupted transfer reconciles by re-sending.
+3. The `MaxChanges` (4096) and 4 MiB log bounds count detached lines too
+   → `store_too_large`.
+4. Append the newly stored raw lines to `streams/<id>.jsonl` and fsync.
+   The stream record is never rewritten — `head` does not move and is
+   echoed back for confirmation.
+
+Readers tolerate a log that interleaves detached lines with the head
+chain: on load, a line whose `parent` continues the first-parent chain
+advances the chain cursor; anything else is detached and must verify
+(`sig_invalid` unchanged) with a `parent` that is null or already-seen
+content — `change_malformed` otherwise. The record head is checked
+against the chain cursor, not the last log line, and append crash
+recovery (§3.1) rolls forward to the cursor, never to a detached line.
+
+### 2.5 `create` semantics
 
 - Validate the record shape: `id`/`name`/`created` present; `name` is
   `[a-z0-9-]{1,32}`; `id` parses as UUID → else `stream_malformed`.
@@ -178,7 +227,7 @@ interpret them.
 - Write `streams/<id>.json` only. The `.jsonl` is created lazily by the
   first `append` — identical to the guest `fork`, which writes no log.
 
-### 2.5 Wire-only refusal names (additions to the vocabulary)
+### 2.6 Wire-only refusal names (additions to the vocabulary)
 
 `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`,
 `store_not_found`, `store_missing`, `store_io`. Everything else is the

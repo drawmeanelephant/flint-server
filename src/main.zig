@@ -282,5 +282,6 @@ test {
     _ = proto;
     _ = serve;
     _ = @import("logging.zig");
+    _ = @import("deposit_test.zig");
     _ = @import("conformance_test.zig");
 }
