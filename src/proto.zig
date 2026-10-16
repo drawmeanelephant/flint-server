@@ -12,7 +12,7 @@ const Stream = store.Stream;
 /// Protocol-visible spec revision, kept in lockstep with the repo-root
 /// SPECREV file by tools/tests/test_specrev.py (docs/spec-versioning.md).
 /// Announced in `hello` ok replies.
-pub const SpecRev: u32 = 2;
+pub const SpecRev: u32 = 3;
 
 pub const Session = struct {
     root_path: []const u8,
@@ -150,6 +150,8 @@ pub fn handleLine(
         try handleCreate(io, allocator, session, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "append")) {
         try handleAppend(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "deposit")) {
+        try handleDeposit(io, allocator, session, obj, seq_val, w);
     } else {
         try writeRefusal(w, seq_val, .usage, "unknown op");
     }
@@ -591,6 +593,81 @@ fn handleAppend(
     try w.print("{{\"seq\":{d},\"ok\":true,\"head\":", .{seq});
     try json.writeNullableString(w, new_head);
     try w.writeAll("}\n");
+}
+
+/// `deposit` — spec_rev 3 detached Change lines (client spec §2.7): appends
+/// signed Changes that do not extend the head to an existing stream's log.
+/// Reply echoes the unchanged head plus how many lines were actually stored
+/// (byte-identical resends skip). Old servers answer `usage` for this op,
+/// which is the client's signal to fall back to spec_rev 2 re-anchoring.
+fn handleDeposit(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    obj: std.json.ObjectMap,
+    seq: u64,
+    w: *Io.Writer,
+) Io.Writer.Error!void {
+    const stream_val = obj.get("stream") orelse {
+        try writeRefusal(w, seq, .usage, "missing stream");
+        return;
+    };
+    const stream_id = switch (stream_val) {
+        .string => |s| s,
+        else => {
+            try writeRefusal(w, seq, .usage, "invalid stream");
+            return;
+        },
+    };
+    if (stream_id.len == 0) {
+        try writeRefusal(w, seq, .usage, "empty stream");
+        return;
+    }
+
+    const changes_val = obj.get("changes") orelse {
+        try writeRefusal(w, seq, .usage, "missing changes");
+        return;
+    };
+    const changes_arr = switch (changes_val) {
+        .array => |arr| arr.items,
+        else => {
+            try writeRefusal(w, seq, .usage, "changes must be an array");
+            return;
+        },
+    };
+
+    var raw_lines = allocator.alloc([]const u8, changes_arr.len) catch return error.WriteFailed;
+    defer allocator.free(raw_lines);
+
+    for (changes_arr, 0..) |item, i| {
+        switch (item) {
+            .string => |s| raw_lines[i] = s,
+            else => {
+                try writeRefusal(w, seq, .change_malformed, "change entry must be a raw JSONL string");
+                return;
+            },
+        }
+    }
+
+    var detail: ?[]const u8 = null;
+    const result = storeio.depositStreamChanges(
+        io,
+        allocator,
+        session.root_path,
+        stream_id,
+        raw_lines,
+        session.allow_authors,
+        &detail,
+    ) catch |err| {
+        const info = storeio.refusalForError(err);
+        try writeRefusal(w, seq, info.code, detail orelse info.detail);
+        return;
+    };
+    defer if (result.head) |h| allocator.free(h);
+
+    try w.print("{{\"seq\":{d},\"ok\":true,\"head\":", .{seq});
+    try json.writeNullableString(w, result.head);
+    try w.print(",\"stored\":{d}}}\n", .{result.stored});
 }
 
 test "hello reply announces the embedded spec revision" {

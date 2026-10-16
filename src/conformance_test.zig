@@ -317,6 +317,158 @@ test "M106c: append all-or-nothing batch rollback, message_invalid, sig_invalid,
     }
 }
 
+test "M106g: deposit stores detached changes without moving head, resolves forked_from (#40)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ts = try TempStore.init(allocator);
+    defer ts.deinit(allocator);
+
+    const seed = store.decodeLowerHexFixed(32, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").?;
+    const stream_id = "0199de2d-dc00-7000-8000-000000000020";
+    const c1_id = "0199de2d-dc00-7000-8000-000000000201";
+    const c2_id = "0199de2d-dc00-7000-8000-000000000202";
+    const c3_id = "0199de2d-dc00-7000-8000-000000000203";
+    const d1_id = "0199de2d-dc00-7000-8000-000000000301";
+    const d2_id = "0199de2d-dc00-7000-8000-000000000302";
+    const orphan_id = "0199de2d-dc00-7000-8000-000000000999";
+
+    try storeio.createStream(io, allocator, ts.root_path, .{
+        .id = stream_id,
+        .name = "main",
+        .head = null,
+        .created = 1760000000000,
+    });
+
+    const c1_line = try makeSignedChangeLine(allocator, seed, c1_id, null, stream_id, 1760000000000, "base commit", &.{}, null);
+    defer allocator.free(c1_line);
+    const c2_line = try makeSignedChangeLine(allocator, seed, c2_id, c1_id, stream_id, 1760000001000, "head commit", &.{}, null);
+    defer allocator.free(c2_line);
+
+    const new_head = try storeio.appendStreamChanges(io, allocator, ts.root_path, stream_id, null, &.{ c1_line, c2_line }, null);
+    defer allocator.free(new_head.?);
+    try std.testing.expectEqualStrings(c2_id, new_head.?);
+
+    // Detached ancestry: d1 siblings c2 under c1; d2 extends d1. Neither
+    // continues the record head.
+    const d1_line = try makeSignedChangeLine(allocator, seed, d1_id, c1_id, stream_id, 1760000002000, "preserved original", &.{}, null);
+    defer allocator.free(d1_line);
+    const d2_line = try makeSignedChangeLine(allocator, seed, d2_id, d1_id, stream_id, 1760000003000, "preserved child", &.{}, null);
+    defer allocator.free(d2_line);
+
+    // Wire check: deposit replies echo the unchanged head and stored count.
+    {
+        var req_buf: Io.Writer.Allocating = .init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll("{\"op\":\"deposit\",\"seq\":1,\"stream\":\"main\",\"changes\":[");
+        try json.writeGoJsonString(&req_buf.writer, d1_line);
+        try req_buf.writer.writeByte(',');
+        try json.writeGoJsonString(&req_buf.writer, d2_line);
+        try req_buf.writer.writeAll("]}\n");
+
+        var in_reader = Io.Reader.fixed(req_buf.written());
+        var out_writer: Io.Writer.Allocating = .init(allocator);
+        defer out_writer.deinit();
+        try serve.serveStream(io, allocator, .{ .root_path = ts.root_path }, &in_reader, &out_writer.writer);
+
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "{{\"seq\":1,\"ok\":true,\"head\":\"{s}\",\"stored\":2}}\n",
+            .{c2_id},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, out_writer.written());
+    }
+
+    // Log order is append order; detached lines load and verify but head stays c2.
+    {
+        var loaded = try storeio.loadStream(io, allocator, ts.root_path, stream_id);
+        defer loaded.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 4), loaded.changes.len);
+        try std.testing.expectEqualStrings(d2_id, loaded.changes[3].id);
+        try std.testing.expectEqualStrings(c2_id, loaded.stream.head.?);
+    }
+
+    // Byte-identical resend is idempotent: nothing stored, head unchanged.
+    {
+        var detail: ?[]const u8 = null;
+        const res = try storeio.depositStreamChanges(io, allocator, ts.root_path, stream_id, &.{d1_line}, null, &detail);
+        defer if (res.head) |h| allocator.free(h);
+        try std.testing.expectEqual(@as(usize, 0), res.stored);
+        try std.testing.expectEqualStrings(c2_id, res.head.?);
+    }
+
+    // Same id, different bytes -> id conflict; nothing written.
+    const d1_conflict = try makeSignedChangeLine(allocator, seed, d1_id, c1_id, stream_id, 1760000002000, "different payload", &.{}, null);
+    defer allocator.free(d1_conflict);
+    {
+        var detail: ?[]const u8 = null;
+        try std.testing.expectError(
+            error.ChangeMalformed,
+            storeio.depositStreamChanges(io, allocator, ts.root_path, stream_id, &.{d1_conflict}, null, &detail),
+        );
+        try std.testing.expectEqualStrings("id conflict", detail.?);
+    }
+
+    // parent == current head is an append, not a deposit.
+    const ext_line = try makeSignedChangeLine(allocator, seed, "0199de2d-dc00-7000-8000-000000000204", c2_id, stream_id, 1760000004000, "would extend head", &.{}, null);
+    defer allocator.free(ext_line);
+    {
+        var detail: ?[]const u8 = null;
+        try std.testing.expectError(
+            error.ChangeMalformed,
+            storeio.depositStreamChanges(io, allocator, ts.root_path, stream_id, &.{ext_line}, null, &detail),
+        );
+        try std.testing.expectEqualStrings("extends head", detail.?);
+    }
+
+    // Orphan parent -> detached parent unknown.
+    const orphan_line = try makeSignedChangeLine(allocator, seed, "0199de2d-dc00-7000-8000-000000000205", orphan_id, stream_id, 1760000005000, "orphan", &.{}, null);
+    defer allocator.free(orphan_line);
+    {
+        var detail: ?[]const u8 = null;
+        try std.testing.expectError(
+            error.ChangeMalformed,
+            storeio.depositStreamChanges(io, allocator, ts.root_path, stream_id, &.{orphan_line}, null, &detail),
+        );
+        try std.testing.expectEqualStrings("detached parent unknown", detail.?);
+    }
+
+    // Empty batch and missing stream refuse without writing.
+    try std.testing.expectError(
+        error.ChangeMalformed,
+        storeio.depositStreamChanges(io, allocator, ts.root_path, stream_id, &.{}, null, null),
+    );
+    try std.testing.expectError(
+        error.StreamMissing,
+        storeio.depositStreamChanges(io, allocator, ts.root_path, "0199de2d-dc00-7000-8000-0000000000ff", &.{d1_line}, null, null),
+    );
+
+    // The #40 acceptance: a fork whose forked_from.change lives only as a
+    // deposited detached line now passes reachability — no re-anchoring.
+    try storeio.createStream(io, allocator, ts.root_path, .{
+        .id = "0199de2d-dc00-7000-8000-000000000040",
+        .name = "recovered",
+        .head = d2_id,
+        .created = 1760000010000,
+        .forked_from = .{ .stream = stream_id, .change = d2_id },
+    });
+
+    // An ordinary append still works with detached lines interleaved in the
+    // log: c3 chains on c2 even though d1/d2 trail it in the file.
+    const c3_line = try makeSignedChangeLine(allocator, seed, c3_id, c2_id, stream_id, 1760000006000, "post-deposit commit", &.{}, null);
+    defer allocator.free(c3_line);
+    const c3_head = try storeio.appendStreamChanges(io, allocator, ts.root_path, stream_id, c2_id, &.{c3_line}, null);
+    defer allocator.free(c3_head.?);
+    try std.testing.expectEqualStrings(c3_id, c3_head.?);
+    {
+        var loaded = try storeio.loadStream(io, allocator, ts.root_path, stream_id);
+        defer loaded.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 5), loaded.changes.len);
+        try std.testing.expectEqualStrings(c3_id, loaded.stream.head.?);
+    }
+}
+
 test "M106c & M106f: golden transcript hello_list.ndjson" {
     const allocator = std.testing.allocator;
     var ts = try TempStore.init(allocator);

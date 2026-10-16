@@ -42,7 +42,7 @@ should serve this protocol so guest and host are interchangeable endpoints.
 - Refusal names are the ADR/Go vocabulary (`stream_missing`,
   `stream_exists`, `stale_head`, `change_malformed`, `sig_invalid`,
   `store_too_large`, `stream_malformed`, `stream_torn`,
-  `message_invalid`, `usage`, …). Wire additions are listed in §2.5 and
+  `message_invalid`, `usage`, …). Wire additions are listed in §2.6 and
   nowhere else.
 - No GPL-family code anywhere (VirelaiOS rule; carries over).
 
@@ -117,6 +117,7 @@ Refusal:
 | `read` | `stream`, `after` (optional change id), `limit` (optional, default 256, max 1024) | `record`, `head`, `changes:[<raw line>,…]`, `more` | `stream_missing`, `change_missing` (unknown `after`) |
 | `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`/`change_missing` (bad `forked_from`), `store_io` |
 | `append` | `stream` (id), `expected_head` (nullable), `changes:[<raw line>,…]` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed`, `store_io` |
+| `deposit` | `stream` (id or name), `changes:[<raw line>,…]` | `head:<unchanged head>`, `stored:<n>` | `stream_missing`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed`, `store_io` |
 
 `stream`/`after` fields take canonical lowercase UUID strings; `open` also
 accepts a stream **name**.
@@ -178,7 +179,59 @@ interpret them.
 - Write `streams/<id>.json` only. The `.jsonl` is created lazily by the
   first `append` — identical to the guest `fork`, which writes no log.
 
-### 2.5 Wire-only refusal names (additions to the vocabulary)
+### 2.5 `deposit` semantics — detached Change lines (spec_rev 3)
+
+`deposit` appends **detached** signed Change lines — valid Changes of the
+target stream that do not sit on the head's first-parent chain — to
+`streams/<id>.jsonl` without moving the record head (client spec §2.7).
+This makes preserved work publishable: the signed Change behind a saved
+recovery fork, or any Change a merge's `merged` link names, becomes
+retrievable by `read`/`open`/`heads` on the origin stream itself. No new
+retrieval op is needed and the stream record is never rewritten.
+
+1. Resolve `stream` by id **or** name → else `stream_missing`.
+2. The batch carries 1–256 raw lines → else `change_malformed`.
+3. Validate **all** Changes before appending any — per-line rules match
+   `append`: `ParseChange` shape, `c.stream == resolved id`, message
+   bounds (`message_invalid`), `VerifyChange` (`sig_invalid`), and the
+   `--allow-author` gate (`author_not_allowed`).
+4. Dedupe by `id`: a byte-identical repeat of an id already in the log
+   (or earlier in this batch) is skipped and does not count toward
+   `stored`; the same id under different bytes refuses `change_malformed`
+   (`id conflict`). Deposits are therefore idempotent — an interrupted
+   transfer reconciles by re-sending.
+5. Detached rules on non-duplicates:
+   - `parent == record.head` → `change_malformed` (`extends head`): that
+     Change belongs to `append`, not `deposit`.
+   - Every other `parent` must be null, an id already in the log, the
+     stream's `forked_from.change`, or an id earlier in the same batch →
+     else `change_malformed` (`detached parent unknown`). Deposits are
+     ancestry-complete: a stored detached Change's whole first-parent
+     ancestry back to a root or to existing log content is in the log.
+6. Existing bounds apply to detached lines: total count ≤ `MaxChanges`
+   (4096) and `.jsonl` size ≤ `MaxFileReadBytes` (4 MiB) after append →
+   `store_too_large`.
+7. Append the surviving raw lines verbatim to `streams/<id>.jsonl` and
+   fsync. The reply echoes the unchanged `head` and `stored` — the count
+   of lines actually written (0 on a pure resend).
+
+Nothing is appended unless the entire batch validates, and nothing about
+the stream record changes. `read` returns detached lines verbatim in log
+order, and `forked_from.change` resolution (§2.4) sees them — that is the
+point: a fork whose origin exists only as a detached line can `create`.
+
+Because detached lines may sit anywhere past the chain tip, `loadStream`
+generalizes its verification: a Change whose `parent` equals the current
+chain cursor advances the cursor; any other line is detached — verified
+and kept only when its parent is null or content already seen in the
+log (`forked_from.change` counts) — and the record head is compared
+against the cursor, not the file's last line. A stored detached line
+whose parent points at later content is `change_malformed` on load.
+
+A server that predates spec_rev 3 answers `usage` on `deposit` — that
+refusal is the client's fallback signal, not a deposit failure.
+
+### 2.6 Wire-only refusal names (additions to the vocabulary)
 
 `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`,
 `store_not_found`, `store_missing`, `store_io`. Everything else is the

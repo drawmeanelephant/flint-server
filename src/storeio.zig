@@ -416,7 +416,22 @@ pub fn loadStream(io: Io, allocator: Allocator, root_path: []const u8, stream_id
         raw_lines_owned.deinit(allocator);
     }
 
-    for (lines, 0..) |line, idx| {
+    // spec_rev 3 detached lines (client spec §2.7): a Change whose `parent`
+    // equals the chain cursor extends the first-parent chain and advances it;
+    // anything else is detached and must anchor to content already seen in
+    // this log — null, the fork origin, or an earlier line's id.
+    var cursor: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen_ids.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen_ids.deinit();
+    }
+    if (st.forked_from) |ff| {
+        try seen_ids.put(try allocator.dupe(u8, ff.change), {});
+    }
+
+    for (lines) |line| {
         var c = change.parseChange(allocator, line) catch |err| switch (err) {
             error.ChangeMalformed, error.SigInvalid => return error.ChangeMalformed,
             error.OutOfMemory => return error.OutOfMemory,
@@ -425,12 +440,13 @@ pub fn loadStream(io: Io, allocator: Allocator, root_path: []const u8, stream_id
 
         if (!std.mem.eql(u8, c.stream, stream_id)) return error.ChangeMalformed;
 
-        if (idx == 0) {
-            const expected_first_parent: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
-            if (!optStrEql(c.parent, expected_first_parent)) return error.ChangeMalformed;
+        if (optStrEql(c.parent, cursor)) {
+            cursor = c.id;
+        } else if (c.parent == null or seen_ids.contains(c.parent.?)) {
+            // Detached line: tolerated, verified like any other, but it does
+            // not advance the chain cursor and can never become the head.
         } else {
-            const prev_id = changes.items[idx - 1].id;
-            if (!optStrEql(c.parent, prev_id)) return error.ChangeMalformed;
+            return error.ChangeMalformed;
         }
 
         change.verifyChange(allocator, &c) catch |err| switch (err) {
@@ -439,35 +455,31 @@ pub fn loadStream(io: Io, allocator: Allocator, root_path: []const u8, stream_id
             error.OutOfMemory => return error.OutOfMemory,
         };
 
+        const id_copy = try allocator.dupe(u8, c.id);
+        errdefer allocator.free(id_copy);
+        try seen_ids.put(id_copy, {});
+
         try changes.append(allocator, c);
         try raw_lines_owned.append(allocator, try allocator.dupe(u8, line));
     }
 
-    const expected_first_parent: ?[]const u8 = if (st.forked_from) |ff| ff.change else null;
+    // The record head must equal the chain cursor — the last first-parent
+    // chain line, not the file's last line (trailing detached lines do not
+    // move the head). Roll-forward recovery compares against `cursor`.
     if (changes.items.len == 0) {
-        if (!optStrEql(st.head, expected_first_parent)) return error.StreamMalformed;
-    } else {
-        const last = changes.items[changes.items.len - 1];
-        if (!optStrEql(st.head, last.id)) {
-            var can_roll_forward = optStrEql(st.head, expected_first_parent);
-            if (!can_roll_forward) {
-                for (changes.items[0 .. changes.items.len - 1]) |earlier| {
-                    if (optStrEql(st.head, earlier.id)) {
-                        can_roll_forward = true;
-                        break;
-                    }
-                }
-            }
-            if (can_roll_forward) {
-                const new_head = try allocator.dupe(u8, last.id);
-                if (st.head) |old_h| allocator.free(old_h);
-                st.head = new_head;
-                const updated_bytes = try json.marshalStreamRecord(allocator, st);
-                defer allocator.free(updated_bytes);
-                try writeFileSafe(io, allocator, json_path, updated_bytes);
-            } else {
-                return error.StreamMalformed;
-            }
+        if (!optStrEql(st.head, cursor)) return error.StreamMalformed;
+    } else if (!optStrEql(st.head, cursor)) {
+        const can_roll_forward = optStrEql(st.head, if (st.forked_from) |ff| ff.change else null) or
+            seen_ids.contains(st.head orelse "");
+        if (can_roll_forward) {
+            const new_head = try allocator.dupe(u8, cursor.?);
+            if (st.head) |old_h| allocator.free(old_h);
+            st.head = new_head;
+            const updated_bytes = try json.marshalStreamRecord(allocator, st);
+            defer allocator.free(updated_bytes);
+            try writeFileSafe(io, allocator, json_path, updated_bytes);
+        } else {
+            return error.StreamMalformed;
         }
     }
 
@@ -742,6 +754,185 @@ pub fn appendStreamChanges(
     try writeFileSafe(io, allocator, json_path, updated_record);
 
     return try allocator.dupe(u8, new_head_str);
+}
+
+/// Result of `depositStreamChanges`: the (unchanged) record head and the count
+/// of lines actually written — byte-identical repeats are skipped and do not
+/// count toward `stored`.
+pub const DepositResult = struct {
+    head: ?[]u8,
+    stored: usize,
+};
+
+/// Implements the `deposit` op (client spec §2.7, spec_rev 3): appends
+/// **detached** signed Change lines to an existing stream's `.jsonl` without
+/// moving the record head. Every line validates exactly like `append` —
+/// well-formed Change, `stream` matches, message bounds, signature,
+/// `--allow-author` — plus the detached rules: a non-duplicate Change whose
+/// `parent` equals the current head refuses (`extends head` — that is an
+/// `append`, not a `deposit`), and every deposited parent must be null, an id
+/// already in the log, the fork origin, or an id earlier in the same batch
+/// (`detached parent unknown`). Dedupe by id: byte-identical repeats skip;
+/// the same id under different bytes refuses (`id conflict`). The whole batch
+/// validates before anything is written; the stream record is never touched.
+/// `detail_out`, when provided, receives the static refusal detail for
+/// `ChangeMalformed` refusals so the wire reply can name the violated rule.
+pub fn depositStreamChanges(
+    io: Io,
+    allocator: Allocator,
+    root_path: []const u8,
+    stream_id: []const u8,
+    raw_lines: []const []const u8,
+    allow_authors: ?[]const [64]u8,
+    detail_out: ?*?[]const u8,
+) StoreError!DepositResult {
+    if (detail_out) |d| d.* = null;
+    var idx = try loadStoreIndex(io, allocator, root_path);
+    defer idx.deinit(allocator);
+
+    // The wire field accepts a stream id or name, like `open`.
+    const rec = idx.findByNameOrId(stream_id) orelse return error.StreamMissing;
+    const resolved_id = rec.id;
+
+    var loaded = try loadStream(io, allocator, root_path, resolved_id);
+    defer loaded.deinit(allocator);
+
+    // 1–256 raw lines per request, same quoting rules as `append`.
+    if (raw_lines.len == 0 or raw_lines.len > 256) {
+        if (detail_out) |d| d.* = "batch size out of bounds";
+        return error.ChangeMalformed;
+    }
+
+    // Index existing log ids for dedup and parent anchoring.
+    var existing_by_id = std.StringHashMap(usize).init(allocator);
+    defer {
+        var it = existing_by_id.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        existing_by_id.deinit();
+    }
+    for (loaded.changes, 0..) |c, i| {
+        try existing_by_id.put(try allocator.dupe(u8, c.id), i);
+    }
+    if (loaded.stream.forked_from) |ff| {
+        // The fork origin anchors detached parents but is not a log line.
+        try existing_by_id.put(try allocator.dupe(u8, ff.change), std.math.maxInt(usize));
+    }
+
+    var batch_lines: std.ArrayList([]const u8) = .empty;
+    defer batch_lines.deinit(allocator);
+    var batch_ids = std.StringHashMap(usize).init(allocator);
+    defer {
+        var it = batch_ids.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        batch_ids.deinit();
+    }
+
+    var append_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer append_buf.deinit();
+
+    var stored: usize = 0;
+    for (raw_lines) |raw_line| {
+        const trimmed = std.mem.trimEnd(u8, raw_line, "\r\n");
+        if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '\n') != null or std.mem.indexOfScalar(u8, trimmed, '\r') != null) {
+            return error.ChangeMalformed;
+        }
+
+        var c = change.parseChange(allocator, trimmed) catch |err| switch (err) {
+            error.ChangeMalformed, error.SigInvalid => return error.ChangeMalformed,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer c.deinit(allocator);
+
+        if (!std.mem.eql(u8, c.stream, resolved_id)) return error.ChangeMalformed;
+        if (!store.isValidMessage(c.message)) return error.MessageInvalid;
+
+        // Dedupe by id before the detached rules: an identical repeat is a
+        // no-op resend; the same id under different bytes is a conflict.
+        if (existing_by_id.get(c.id)) |slot| {
+            const same_bytes = slot != std.math.maxInt(usize) and
+                std.mem.eql(u8, loaded.raw_lines[slot], trimmed);
+            if (!same_bytes) {
+                if (detail_out) |d| d.* = "id conflict";
+                return error.ChangeMalformed;
+            }
+            continue;
+        }
+        if (batch_ids.get(c.id)) |bi| {
+            // Byte-identical repeat within the batch skips like a resend.
+            if (std.mem.eql(u8, batch_lines.items[bi], trimmed)) continue;
+            if (detail_out) |d| d.* = "id conflict";
+            return error.ChangeMalformed;
+        }
+
+        // Detached rules: never extends the head; the parent must anchor to
+        // content already stored (or earlier in this batch) so deposits are
+        // ancestry-complete.
+        if (optStrEql(c.parent, loaded.stream.head)) {
+            if (detail_out) |d| d.* = "extends head";
+            return error.ChangeMalformed;
+        }
+        const parent_known = c.parent == null or
+            existing_by_id.contains(c.parent.?) or
+            batch_ids.contains(c.parent.?);
+        if (!parent_known) {
+            if (detail_out) |d| d.* = "detached parent unknown";
+            return error.ChangeMalformed;
+        }
+
+        change.verifyChange(allocator, &c) catch |err| switch (err) {
+            error.SigInvalid => return error.SigInvalid,
+            error.ChangeMalformed => return error.ChangeMalformed,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        if (!isAuthorAllowed(c.author, allow_authors)) {
+            return error.AuthorNotAllowed;
+        }
+
+        const id_copy = try allocator.dupe(u8, c.id);
+        errdefer allocator.free(id_copy);
+        try batch_lines.append(allocator, trimmed);
+        try batch_ids.put(id_copy, batch_lines.items.len - 1);
+
+        append_buf.writer.writeAll(trimmed) catch return error.OutOfMemory;
+        append_buf.writer.writeByte('\n') catch return error.OutOfMemory;
+        stored += 1;
+    }
+
+    // Existing bounds apply to detached lines too.
+    if (idx.total_changes + stored > store.MaxChanges) {
+        return error.StoreTooLarge;
+    }
+
+    const streams_dir_path = try std.fs.path.join(allocator, &.{ root_path, "streams" });
+    defer allocator.free(streams_dir_path);
+    const jsonl_file = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{resolved_id});
+    defer allocator.free(jsonl_file);
+    const jsonl_path = try std.fs.path.join(allocator, &.{ streams_dir_path, jsonl_file });
+    defer allocator.free(jsonl_path);
+
+    var existing_jsonl_len: usize = 0;
+    if (fileExists(io, jsonl_path)) {
+        var f = Io.Dir.cwd().openFile(io, jsonl_path, .{ .mode = .read_only }) catch return error.IoFailure;
+        existing_jsonl_len = @intCast(f.length(io) catch {
+            f.close(io);
+            return error.IoFailure;
+        });
+        f.close(io);
+    }
+    if (existing_jsonl_len + append_buf.written().len > store.MaxFileReadBytes) {
+        return error.StoreTooLarge;
+    }
+
+    if (append_buf.written().len > 0) {
+        try appendSync(io, jsonl_path, append_buf.written());
+    }
+
+    // The record head never moves; echo it back.
+    return .{
+        .head = if (loaded.stream.head) |h| try allocator.dupe(u8, h) else null,
+        .stored = stored,
+    };
 }
 
 test "read-only streams dir: writes fail IoFailure and map to store_io" {

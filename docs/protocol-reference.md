@@ -22,6 +22,7 @@ Omitting it currently defaults to zero; clients should always send it.
 | `read` | `op`, `stream` | Read raw signed Change lines after a cursor. Limits above 1024 are clamped. |
 | `create` | `op`, `record` | Create a stream record; non-null heads must refer to a valid fork point. |
 | `append` | `op`, `stream`, `changes` | Append a nonempty, fully verified batch. Change strings are raw JSONL bytes without the final newline. |
+| `deposit` | `op`, `stream`, `changes` | Append detached signed Change lines to an existing stream's log without moving the head (spec_rev 3). Change strings are raw JSONL bytes without the final newline. |
 
 ## Responses
 
