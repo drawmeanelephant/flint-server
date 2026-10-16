@@ -7,6 +7,7 @@ const change = @import("change.zig");
 const manifest = @import("manifest.zig");
 const storeio = @import("storeio.zig");
 const contentio = @import("contentio.zig");
+const indexcache = @import("indexcache.zig");
 const proto = @import("proto.zig");
 
 // spec_rev 4 content layer coverage (issue #43): blob_put/blob_get,
@@ -633,4 +634,95 @@ test "read-only streams dir: writes fail IoFailure and map to store_io" {
     try std.testing.expectEqualStrings("io error", info.detail);
     const malformed = storeio.refusalForError(error.StreamMalformed);
     try std.testing.expectEqual(store.RefusalCode.stream_malformed, malformed.code);
+}
+
+test "index cache: blob_put and put_manifest invalidate; get_manifest reuses the cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tempStorePath(allocator, &tmp);
+    defer allocator.free(root_path);
+    try storeio.initStore(io, allocator, root_path);
+
+    const seed: [32]u8 = @splat(0x42);
+    const stream_id = "0199de2d-dc00-7000-8000-000000000010";
+    const c1_id = "0199de2d-dc00-7000-8000-000000000100";
+    try storeio.createStream(io, allocator, root_path, .{
+        .id = stream_id,
+        .name = "main",
+        .created = 1760000000000,
+    });
+    const c1_line = try testSignedChangeLine(allocator, seed, c1_id, null, stream_id, 1760000000000, "first");
+    defer allocator.free(c1_line);
+    const head = try storeio.appendStreamChanges(io, allocator, root_path, stream_id, null, &.{c1_line}, null);
+    defer if (head) |h| allocator.free(h);
+
+    const blob_id = sha256Hex("blob bytes");
+    const blob_hex = try hexEncodeAlloc(allocator, "blob bytes");
+    defer allocator.free(blob_hex);
+    const files = [_]store.ManifestFile{.{ .path = "a.zig", .blob = &blob_id, .bytes = 10, .mode = 644 }};
+    const m1 = try testSignedManifestLine(allocator, seed, stream_id, c1_id, &files);
+    defer allocator.free(m1);
+
+    var cache: indexcache.StoreIndexCache = .{};
+    defer cache.deinit(allocator);
+    var session = proto.Session{ .root_path = root_path, .index_cache = &cache };
+
+    const send = struct {
+        fn call(a: Allocator, s: *proto.Session, line: []const u8) ![]u8 {
+            var out: Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try proto.handleLine(std.testing.io, a, s, line, &out.writer);
+            return out.toOwnedSlice();
+        }
+    }.call;
+
+    // Warm the shared cache.
+    const list1 = try send(allocator, &session, "{\"op\":\"list\",\"seq\":1}");
+    defer allocator.free(list1);
+    try std.testing.expectEqual(@as(usize, 1), cache.loads);
+
+    // blob_put writes blobs/, invisible to the streams/ fingerprint — only
+    // the explicit invalidate drops the cache here.
+    var req: Io.Writer.Allocating = .init(allocator);
+    defer req.deinit();
+    try req.writer.print("{{\"op\":\"blob_put\",\"seq\":2,\"id\":\"{s}\",\"hex\":\"{s}\"}}", .{ blob_id, blob_hex });
+    const blob_reply = try send(allocator, &session, req.written());
+    defer allocator.free(blob_reply);
+    try std.testing.expectEqualStrings("{\"seq\":2,\"ok\":true}\n", blob_reply);
+
+    const list2 = try send(allocator, &session, "{\"op\":\"list\",\"seq\":3}");
+    defer allocator.free(list2);
+    try std.testing.expectEqual(@as(usize, 2), cache.loads);
+
+    // put_manifest writes manifests/, likewise outside the fingerprint.
+    req.clearRetainingCapacity();
+    try req.writer.print("{{\"op\":\"put_manifest\",\"seq\":4,\"stream\":\"{s}\",\"lines\":[", .{stream_id});
+    try json.writeGoJsonString(&req.writer, m1);
+    try req.writer.writeAll("]}");
+    const put_reply = try send(allocator, &session, req.written());
+    defer allocator.free(put_reply);
+    try std.testing.expectEqualStrings("{\"seq\":4,\"ok\":true,\"stored\":1}\n", put_reply);
+
+    const list3 = try send(allocator, &session, "{\"op\":\"list\",\"seq\":5}");
+    defer allocator.free(list3);
+    try std.testing.expectEqual(@as(usize, 3), cache.loads);
+
+    // get_manifest reads the index through the cache: a byte-identical
+    // put_manifest resend invalidates first, then get_manifest reloads once
+    // and the repeat call hits the cache.
+    const put_reply2 = try send(allocator, &session, req.written());
+    defer allocator.free(put_reply2);
+    try std.testing.expectEqualStrings("{\"seq\":4,\"ok\":true,\"stored\":0}\n", put_reply2);
+
+    const get1 = try send(allocator, &session, "{\"op\":\"get_manifest\",\"seq\":6,\"stream\":\"0199de2d-dc00-7000-8000-000000000010\"}");
+    defer allocator.free(get1);
+    try std.testing.expect(std.mem.indexOf(u8, get1, "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 4), cache.loads);
+
+    const get2 = try send(allocator, &session, "{\"op\":\"get_manifest\",\"seq\":7,\"stream\":\"0199de2d-dc00-7000-8000-000000000010\"}");
+    defer allocator.free(get2);
+    try std.testing.expectEqual(@as(usize, 4), cache.loads);
 }

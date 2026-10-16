@@ -10,7 +10,7 @@ const auth = @import("auth.zig");
 const proto = @import("proto.zig");
 const serve = @import("serve.zig");
 
-const TempStore = struct {
+pub const TempStore = struct {
     tmp: std.testing.TmpDir,
     root_path: []u8,
 
@@ -29,7 +29,7 @@ const TempStore = struct {
     }
 };
 
-fn makeSignedChangeLine(
+pub fn makeSignedChangeLine(
     alloc: std.mem.Allocator,
     s_seed: [32]u8,
     id: []const u8,
@@ -875,4 +875,18 @@ test "storage boundary: 4096 signed Changes fit and the next append is atomic re
     try std.testing.expectError(error.StoreTooLarge, storeio.appendStreamChanges(io, a, ts.root_path, stream_id, final_id, &.{extra}, null));
     try expectFileBytes(log_path, log_before);
     try expectFileBytes(record_path, record_before);
+}
+
+/// Sends one request line through `handleLine` and returns the slice of
+/// `out` written for it.
+pub fn sendLine(
+    session: *proto.Session,
+    out: *Io.Writer.Allocating,
+    sent: *usize,
+    line: []const u8,
+) ![]const u8 {
+    try proto.handleLine(std.testing.io, std.testing.allocator, session, line, &out.writer);
+    const reply = out.written()[sent.*..];
+    sent.* = out.written().len;
+    return reply;
 }

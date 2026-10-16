@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const store = @import("store.zig");
+const storeio = @import("storeio.zig");
+const indexcache = @import("indexcache.zig");
 const proto = @import("proto.zig");
 const logging = @import("logging.zig");
 
@@ -11,6 +13,10 @@ pub const ServeConfig = struct {
     allow_authors: ?[]const [64]u8 = null,
     fixed_nonce: ?[16]u8 = null,
     log_requests: bool = false,
+    /// Shared store-index cache (issue #46). Owned by the caller; serving
+    /// entry points attach one spanning the whole server so the parsed index
+    /// survives across sessions. When null a per-session cache is used.
+    index_cache: ?*indexcache.StoreIndexCache = null,
 };
 
 /// Serves a single NDJSON session reading lines from `reader` and writing responses to `writer`.
@@ -21,11 +27,15 @@ pub fn serveStream(
     reader: *Io.Reader,
     writer: *Io.Writer,
 ) !void {
+    var session_cache: indexcache.StoreIndexCache = .{};
+    defer session_cache.deinit(allocator);
+
     var session = proto.Session{
         .root_path = cfg.root_path,
         .auth_key = cfg.auth_key,
         .allow_authors = cfg.allow_authors,
         .fixed_nonce = cfg.fixed_nonce,
+        .index_cache = cfg.index_cache orelse &session_cache,
     };
     var connection: [16]u8 = undefined;
     if (cfg.log_requests) io.random(&connection);
@@ -90,12 +100,17 @@ pub fn serveStdio(io: Io, allocator: Allocator, cfg: ServeConfig) !void {
     try stderr_w.interface.writeAll("flintd: ready\n");
     try stderr_w.interface.flush();
 
+    var index_cache: indexcache.StoreIndexCache = .{};
+    defer index_cache.deinit(allocator);
+    var session_cfg = cfg;
+    session_cfg.index_cache = &index_cache;
+
     var in_buf: [64 * 1024]u8 = undefined;
     var out_buf: [64 * 1024]u8 = undefined;
     var stdin_r = Io.File.stdin().readerStreaming(io, &in_buf);
     var stdout_w = Io.File.stdout().writerStreaming(io, &out_buf);
 
-    try serveStream(io, allocator, cfg, &stdin_r.interface, &stdout_w.interface);
+    try serveStream(io, allocator, session_cfg, &stdin_r.interface, &stdout_w.interface);
 }
 
 /// A `Stream.Reader` equivalent for accepted TCP connections that applies
@@ -242,6 +257,13 @@ pub fn serveTcp(
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    // Sessions are serialized by the accept loop, so one cache is shared
+    // safely across every connection for the life of the server.
+    var index_cache: indexcache.StoreIndexCache = .{};
+    defer index_cache.deinit(allocator);
+    var session_cfg = cfg;
+    session_cfg.index_cache = &index_cache;
+
     var stderr_buf: [256]u8 = undefined;
     var stderr_w = Io.File.stderr().writerStreaming(io, &stderr_buf);
     try stderr_w.interface.print("flintd: listening {f}\n", .{server.socket.address});
@@ -266,7 +288,7 @@ pub fn serveTcp(
         var timed_r = TimedReader.init(stream, io, &r_buf, read_timeout);
         var net_w = stream.writer(io, &w_buf);
 
-        serveStream(io, allocator, cfg, &timed_r.interface, &net_w.interface) catch |err| {
+        serveStream(io, allocator, session_cfg, &timed_r.interface, &net_w.interface) catch |err| {
             const timed_out = if (timed_r.err) |e| e == error.Timeout else false;
             const reason: []const u8 = if (timed_out) "idle_timeout" else @errorName(err);
             stderr_w.interface.print("flintd: disconnect {f} reason={s}\n", .{ stream.socket.address, reason }) catch {};
@@ -283,7 +305,6 @@ pub fn serveTcp(
 test "TimedReader: idle peer surfaces Timeout and ends the session" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const storeio = @import("storeio.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -320,7 +341,6 @@ test "TimedReader: idle peer surfaces Timeout and ends the session" {
 test "TimedReader: active peer is served normally before the deadline" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const storeio = @import("storeio.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

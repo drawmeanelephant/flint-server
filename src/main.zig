@@ -280,6 +280,8 @@ test {
     _ = manifest;
     _ = jsonl;
     _ = storeio;
+    _ = @import("indexcache.zig");
+    _ = @import("indexcache_test.zig");
     _ = auth;
     _ = proto;
     _ = serve;

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const json = @import("json.zig");
+const indexcache = @import("indexcache.zig");
 const storeio = @import("storeio.zig");
 const contentio = @import("contentio.zig");
 const proto = @import("proto.zig");
@@ -17,6 +18,7 @@ pub fn handlePutManifest(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -62,14 +64,19 @@ pub fn handlePutManifest(
         }
     }
 
-    const stored = contentio.putManifestStreamLines(
+    const put_result = contentio.putManifestStreamLines(
         io,
         allocator,
         session.root_path,
         stream_arg,
         raw_lines,
         session.allow_authors,
-    ) catch |err| {
+    );
+    // Manifest lines land in manifests/, outside the streams index, but the
+    // load inside can roll-forward a streams/*.json and a failed append can
+    // still have fsynced, so drop the cache after every attempt.
+    index_cache.invalidate(allocator);
+    const stored = put_result catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
@@ -86,6 +93,7 @@ pub fn handleGetManifest(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -120,11 +128,10 @@ pub fn handleGetManifest(
         }
     }
 
-    var idx = storeio.loadStoreIndex(io, allocator, session.root_path) catch |err| {
+    const idx = index_cache.get(io, allocator, session.root_path) catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
-    defer idx.deinit(allocator);
 
     const found_st = idx.findById(stream_arg) orelse {
         try writeRefusal(w, seq, .stream_missing, "stream not found");
@@ -205,6 +212,7 @@ pub fn handleBlobPut(
     io: Io,
     allocator: Allocator,
     session: *Session,
+    index_cache: *indexcache.StoreIndexCache,
     obj: std.json.ObjectMap,
     seq: u64,
     w: *Io.Writer,
@@ -237,7 +245,11 @@ pub fn handleBlobPut(
         },
     };
 
-    contentio.putBlob(io, allocator, session.root_path, id_str, hex_str) catch |err| {
+    const put_result = contentio.putBlob(io, allocator, session.root_path, id_str, hex_str);
+    // blobs/ is outside the streams index as well; invalidate on the same
+    // every-mutating-attempt rule as the other write ops.
+    index_cache.invalidate(allocator);
+    put_result catch |err| {
         try writeStoreErrorRefusal(w, seq, err);
         return;
     };
