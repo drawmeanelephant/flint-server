@@ -23,13 +23,17 @@ Omitting it currently defaults to zero; clients should always send it.
 | `create` | `op`, `record` | Create a stream record; non-null heads must refer to a valid fork point. |
 | `append` | `op`, `stream`, `changes` | Append a nonempty, fully verified batch. Change strings are raw JSONL bytes without the final newline. |
 | `deposit` | `op`, `stream`, `changes` | Append detached signed Change lines to an existing stream's log without moving the head (spec_rev 3). Change strings are raw JSONL bytes without the final newline. |
+| `put_manifest` | `op`, `stream`, `lines` | Append signed complete-inventory manifest lines bound to Changes in the stream log (spec_rev 4). Lines are raw JSONL strings; dedupe by change id; all-or-nothing. |
+| `get_manifest` | `op`, `stream` | Return manifest lines in log order after the named change's manifest (spec_rev 4). `after` null returns all lines. |
+| `blob_put` | `op`, `id`, `hex` | Store content-addressed bytes iff SHA-256(decoded) == id (spec_rev 4). `hex` is lowercase hex of the raw blob bytes. |
+| `blob_get` | `op`, `id` | Return stored blob bytes as lowercase hex (spec_rev 4). |
 
 ## Responses
 
 Every reply includes `seq` and `ok`. Refusals additionally include
 `refuse` and `detail`. Success payloads depend on the operation.
 
-Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `store_not_found`, `store_missing`, `store_io`.
+Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `blob_missing`, `blob_malformed`, `manifest_torn`, `change_too_large`, `store_not_found`, `store_missing`, `store_io`.
 
 One session has one request in flight. Lines are bounded to 4 MiB.
 There are at most 4096 changes per stream. `read` defaults to 256

@@ -10,7 +10,7 @@ const auth = @import("auth.zig");
 const proto = @import("proto.zig");
 const serve = @import("serve.zig");
 
-const TempStore = struct {
+pub const TempStore = struct {
     tmp: std.testing.TmpDir,
     root_path: []u8,
 
@@ -29,7 +29,7 @@ const TempStore = struct {
     }
 };
 
-fn makeSignedChangeLine(
+pub fn makeSignedChangeLine(
     alloc: std.mem.Allocator,
     s_seed: [32]u8,
     id: []const u8,

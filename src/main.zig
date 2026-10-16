@@ -283,4 +283,5 @@ test {
     _ = serve;
     _ = @import("logging.zig");
     _ = @import("conformance_test.zig");
+    _ = @import("content_conformance_test.zig");
 }

@@ -60,6 +60,7 @@ makes several protocol-visible changes still bumps once.
 | 1 | `SPECREV` convention; `hello` ok replies announce `spec_rev` | [#34](https://github.com/drawmeanelephant/flint-server/issues/34) |
 | 2 | `store_io` refusal name for store filesystem failures (was `stream_malformed`) | [#36](https://github.com/drawmeanelephant/flint-server/issues/36) |
 | 3 | `deposit` op; stream logs may carry detached Change lines | [#40](https://github.com/drawmeanelephant/flint-server/issues/40) |
+| 4 | `put_manifest`/`get_manifest`/`blob_put`/`blob_get` ops; `blobs/` and `manifests/` store dirs; `blob_missing`, `blob_malformed`, `manifest_torn`, `change_too_large` refusals | [#43](https://github.com/drawmeanelephant/flint-server/issues/43) |
 
 ## 3. The `hello` `spec_rev` field
 

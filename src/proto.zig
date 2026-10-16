@@ -4,6 +4,7 @@ const Io = std.Io;
 const store = @import("store.zig");
 const json = @import("json.zig");
 const storeio = @import("storeio.zig");
+const contentio = @import("contentio.zig");
 const auth = @import("auth.zig");
 const logging = @import("logging.zig");
 const RefusalCode = store.RefusalCode;
@@ -12,7 +13,7 @@ const Stream = store.Stream;
 /// Protocol-visible spec revision, kept in lockstep with the repo-root
 /// SPECREV file by tools/tests/test_specrev.py (docs/spec-versioning.md).
 /// Announced in `hello` ok replies.
-pub const SpecRev: u32 = 3;
+pub const SpecRev: u32 = 4;
 
 pub const Session = struct {
     root_path: []const u8,
@@ -150,6 +151,18 @@ pub fn handleLine(
         try handleCreate(io, allocator, session, obj, seq_val, w);
     } else if (std.mem.eql(u8, op_str, "append")) {
         try handleAppend(io, allocator, session, obj, seq_val, w);
+    } else if (std.mem.eql(u8, op_str, "put_manifest")) {
+        try handlePutManifest(io, allocator, session, obj, seq_val, w);
+        return;
+    } else if (std.mem.eql(u8, op_str, "get_manifest")) {
+        try handleGetManifest(io, allocator, session, obj, seq_val, w);
+        return;
+    } else if (std.mem.eql(u8, op_str, "blob_put")) {
+        try handleBlobPut(io, allocator, session, obj, seq_val, w);
+        return;
+    } else if (std.mem.eql(u8, op_str, "blob_get")) {
+        try handleBlobGet(io, allocator, session, obj, seq_val, w);
+        return;
     } else if (std.mem.eql(u8, op_str, "deposit")) {
         try handleDeposit(io, allocator, session, obj, seq_val, w);
     } else {
@@ -731,4 +744,190 @@ test "request without seq refuses usage" {
         output.written(),
     );
     try std.testing.expectEqual(@as(?u32, null), session.request_seq);
+}
+
+fn getStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// `put_manifest` — spec_rev 4 (blobs spec §9): append signed manifest lines
+/// bound to Changes already in the stream log. All-or-nothing; dedupes by
+/// change id; `stored` counts newly appended lines.
+fn handlePutManifest(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    obj: std.json.ObjectMap,
+    seq: u64,
+    w: *Io.Writer,
+) Io.Writer.Error!void {
+    const stream_id = getStringField(obj, "stream") orelse {
+        try writeRefusal(w, seq, .usage, "missing stream");
+        return;
+    };
+    const lines_val = obj.get("lines") orelse {
+        try writeRefusal(w, seq, .usage, "missing lines");
+        return;
+    };
+    const items = switch (lines_val) {
+        .array => |a| a.items,
+        else => {
+            try writeRefusal(w, seq, .usage, "lines must be an array");
+            return;
+        },
+    };
+    var raw = allocator.alloc([]const u8, items.len) catch return error.WriteFailed;
+    defer allocator.free(raw);
+    for (items, 0..) |it, i| {
+        raw[i] = switch (it) {
+            .string => |s| s,
+            else => {
+                try writeRefusal(w, seq, .change_malformed, "manifest entry must be a raw JSONL string");
+                return;
+            },
+        };
+    }
+    var detail: ?[]const u8 = null;
+    const res = contentio.putManifestLines(
+        io,
+        allocator,
+        session.root_path,
+        stream_id,
+        raw,
+        session.allow_authors,
+        &detail,
+    ) catch |err| {
+        const info = storeio.refusalForError(err);
+        try writeRefusal(w, seq, info.code, detail orelse info.detail);
+        return;
+    };
+    try w.print("{{\"seq\":{d},\"ok\":true,\"stored\":{d}}}\n", .{ seq, res.stored });
+}
+
+/// `get_manifest` — manifest lines in log order, after the named change's
+/// manifest (`after` null = all; `after` naming a manifest-less Change
+/// resends everything since the receiver dedupes).
+fn handleGetManifest(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    obj: std.json.ObjectMap,
+    seq: u64,
+    w: *Io.Writer,
+) Io.Writer.Error!void {
+    const stream_id = getStringField(obj, "stream") orelse {
+        try writeRefusal(w, seq, .usage, "missing stream");
+        return;
+    };
+    var after: ?[]const u8 = null;
+    if (obj.get("after")) |av| {
+        switch (av) {
+            .null => {},
+            .string => |s| after = s,
+            else => {
+                try writeRefusal(w, seq, .usage, "after must be a change id or null");
+                return;
+            },
+        }
+    }
+    const lines = contentio.getManifestLines(io, allocator, session.root_path, stream_id, after) catch |err| {
+        const info = storeio.refusalForError(err);
+        try writeRefusal(w, seq, info.code, info.detail);
+        return;
+    };
+    defer {
+        for (lines) |l| allocator.free(l);
+        allocator.free(lines);
+    }
+    try w.print("{{\"seq\":{d},\"ok\":true,\"lines\":[", .{seq});
+    for (lines, 0..) |l, i| {
+        if (i > 0) try w.writeByte(',');
+        try json.writeGoJsonString(w, l);
+    }
+    try w.writeAll("]}\n");
+}
+
+/// `blob_put` — stores content-addressed bytes iff SHA-256(bytes) == id.
+fn handleBlobPut(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    obj: std.json.ObjectMap,
+    seq: u64,
+    w: *Io.Writer,
+) Io.Writer.Error!void {
+    const id = getStringField(obj, "id") orelse {
+        try writeRefusal(w, seq, .usage, "missing id");
+        return;
+    };
+    const hex = getStringField(obj, "hex") orelse {
+        try writeRefusal(w, seq, .usage, "missing hex");
+        return;
+    };
+    if (hex.len % 2 != 0) {
+        try writeRefusal(w, seq, .blob_malformed, "odd hex length");
+        return;
+    }
+    if (hex.len / 2 > contentio.MaxBlobBytes) {
+        try writeRefusal(w, seq, .change_too_large, "blob exceeds size bound");
+        return;
+    }
+    const bytes = allocator.alloc(u8, hex.len / 2) catch return error.WriteFailed;
+    defer allocator.free(bytes);
+    for (bytes, 0..) |*b, i| {
+        const hi = std.fmt.charToDigit(hex[2 * i], 16) catch {
+            try writeRefusal(w, seq, .blob_malformed, "invalid hex");
+            return;
+        };
+        const lo = std.fmt.charToDigit(hex[2 * i + 1], 16) catch {
+            try writeRefusal(w, seq, .blob_malformed, "invalid hex");
+            return;
+        };
+        b.* = (hi << 4) | lo;
+    }
+    contentio.putBlob(io, allocator, session.root_path, id, bytes) catch |err| {
+        const info = storeio.refusalForError(err);
+        try writeRefusal(w, seq, info.code, info.detail);
+        return;
+    };
+    try w.print("{{\"seq\":{d},\"ok\":true}}\n", .{seq});
+}
+
+/// `blob_get` — returns the stored bytes as lowercase hex.
+fn handleBlobGet(
+    io: Io,
+    allocator: Allocator,
+    session: *Session,
+    obj: std.json.ObjectMap,
+    seq: u64,
+    w: *Io.Writer,
+) Io.Writer.Error!void {
+    const id = getStringField(obj, "id") orelse {
+        try writeRefusal(w, seq, .usage, "missing id");
+        return;
+    };
+    if (id.len != 64) {
+        try writeRefusal(w, seq, .blob_missing, "malformed id");
+        return;
+    }
+    const bytes = contentio.readBlob(io, allocator, session.root_path, id) catch |err| {
+        const info = storeio.refusalForError(err);
+        try writeRefusal(w, seq, info.code, info.detail);
+        return;
+    };
+    defer allocator.free(bytes);
+    var hex = allocator.alloc(u8, bytes.len * 2) catch return error.WriteFailed;
+    defer allocator.free(hex);
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        hex[2 * i] = digits[b >> 4];
+        hex[2 * i + 1] = digits[b & 0x0f];
+    }
+    try w.print("{{\"seq\":{d},\"ok\":true,\"hex\":\"", .{seq});
+    try w.writeAll(hex);
+    try w.writeAll("\"}\n");
 }
