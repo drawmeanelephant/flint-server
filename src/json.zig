@@ -296,7 +296,7 @@ pub fn parseStreamFromValue(allocator: Allocator, val: std.json.Value) ParseErro
         else => return error.StreamMalformed,
     };
 
-    // Spec §2.4: id, name, created must be present.
+    // Spec §2.5: id, name, created must be present.
     const id_val = obj.get("id") orelse return error.StreamMalformed;
     const name_val = obj.get("name") orelse return error.StreamMalformed;
     const created_val = obj.get("created") orelse return error.StreamMalformed;

@@ -8,6 +8,7 @@ pub const MaxStreamNameBytes: usize = 32;
 pub const MaxLineBytes: usize = 4 * 1024 * 1024;
 pub const DefaultReadLimit: usize = 256;
 pub const MaxReadLimit: usize = 1024;
+pub const MaxDepositBatch: usize = 256;
 
 pub const RefusalCode = enum {
     stream_missing,

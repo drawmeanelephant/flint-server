@@ -52,6 +52,7 @@ files.
 | `read` | `stream`, `after`, `limit` (≤1024) | `record`, `head`, `changes`, `more` | `stream_missing`, `change_missing` |
 | `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`, `change_missing` |
 | `append` | `stream`, `expected_head`, `changes` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed` |
+| `deposit` | `stream` (id or name), `changes` (1–256) | `head:<unchanged>`, `stored:<count>` | `stream_missing`, `change_malformed`, `sig_invalid`, `message_invalid`, `author_not_allowed`, `store_too_large` |
 
 `hello` replies announce `spec_rev`, the server's protocol-visible spec
 revision — a drift signal, not negotiation. `proto` remains the only
@@ -73,6 +74,18 @@ For each batch `{expected_head, changes[]}` on a stream:
 Nothing is appended unless the entire batch validates. Changes cross the
 wire as raw JSONL bytes, verbatim — the server never re-serializes them,
 so canonical bytes and signatures are trivially preserved.
+
+## deposit carries detached lines (spec_rev 3)
+
+A log may hold detached Changes — signed Changes of that stream that are
+not on the head's first-parent chain, like a preserved recovery original
+or work a merge's signed `merged` link names. `deposit` appends them
+without moving the head: every `parent` must root in null, the log, the
+stream's `forked_from.change`, or an earlier line in the same batch, and
+a parent equal to the current head refuses `change_malformed` — that is
+an `append`. Byte-identical resends skip (`stored` counts only new
+lines), so an interrupted transfer reconciles by re-sending. Deposited
+lines come back through an ordinary `read`.
 
 ## What the server refuses to do
 
