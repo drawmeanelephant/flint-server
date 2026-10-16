@@ -115,8 +115,8 @@ Refusal:
 | `heads` | — | `heads:{<id>:<head|null>, …}` | — |
 | `open` | `stream` (id or name) | `record:<Stream>` | `stream_missing` |
 | `read` | `stream`, `after` (optional change id), `limit` (optional, default 256, max 1024) | `record`, `head`, `changes:[<raw line>,…]`, `more` | `stream_missing`, `change_missing` (unknown `after`) |
-| `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`/`change_missing` (bad `forked_from`) |
-| `append` | `stream` (id), `expected_head` (nullable), `changes:[<raw line>,…]` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed` |
+| `create` | `record:<Stream>` | `ok:true` | `stream_exists`, `stream_malformed`, `stream_missing`/`change_missing` (bad `forked_from`), `store_io` |
+| `append` | `stream` (id), `expected_head` (nullable), `changes:[<raw line>,…]` | `head:<new head>` | `stream_missing`, `stale_head`, `change_malformed`, `sig_invalid`, `message_invalid`, `store_too_large`, `author_not_allowed`, `store_io` |
 
 `stream`/`after` fields take canonical lowercase UUID strings; `open` also
 accepts a stream **name**.
@@ -181,9 +181,15 @@ interpret them.
 ### 2.5 Wire-only refusal names (additions to the vocabulary)
 
 `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`,
-`store_not_found`, `store_missing`. Everything else is the existing ADR/Go
-vocabulary — a refusal arriving over the wire prints on the client as
-`flint: refuse <name>` with no translation table.
+`store_not_found`, `store_missing`, `store_io`. Everything else is the
+existing ADR/Go vocabulary — a refusal arriving over the wire prints on
+the client as `flint: refuse <name>` with no translation table.
+
+`store_io` means the store filesystem itself failed — permissions, a
+read-only store, disk errors — on any op that touches the store. It is
+distinct from `*_malformed` names, which mean the record or change
+itself failed validation; a `store_io` refusal says nothing about the
+request's validity, and the server keeps serving afterwards.
 
 ## 3. Host deltas
 

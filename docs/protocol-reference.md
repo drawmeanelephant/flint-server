@@ -28,7 +28,7 @@ Omitting it currently defaults to zero; clients should always send it.
 Every reply includes `seq` and `ok`. Refusals additionally include
 `refuse` and `detail`. Success payloads depend on the operation.
 
-Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `store_not_found`, `store_missing`.
+Refusal vocabulary: `stream_missing`, `stream_exists`, `stale_head`, `change_malformed`, `change_missing`, `sig_invalid`, `store_too_large`, `stream_malformed`, `stream_torn`, `message_invalid`, `usage`, `proto_version`, `auth_required`, `auth_failed`, `author_not_allowed`, `store_not_found`, `store_missing`, `store_io`.
 
 One session has one request in flight. Lines are bounded to 4 MiB.
 There are at most 4096 changes per stream. `read` defaults to 256

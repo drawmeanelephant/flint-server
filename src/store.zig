@@ -27,6 +27,7 @@ pub const RefusalCode = enum {
     author_not_allowed,
     store_not_found,
     store_missing,
+    store_io,
     secret_malformed,
 
     pub fn asText(self: RefusalCode) []const u8 {
@@ -48,6 +49,7 @@ pub const RefusalCode = enum {
             .author_not_allowed => "author_not_allowed",
             .store_not_found => "store_not_found",
             .store_missing => "store_missing",
+            .store_io => "store_io",
             .secret_malformed => "secret_malformed",
         };
     }

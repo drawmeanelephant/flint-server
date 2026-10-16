@@ -12,7 +12,7 @@ const Stream = store.Stream;
 /// Protocol-visible spec revision, kept in lockstep with the repo-root
 /// SPECREV file by tools/tests/test_specrev.py (docs/spec-versioning.md).
 /// Announced in `hello` ok replies.
-pub const SpecRev: u32 = 1;
+pub const SpecRev: u32 = 2;
 
 pub const Session = struct {
     root_path: []const u8,
