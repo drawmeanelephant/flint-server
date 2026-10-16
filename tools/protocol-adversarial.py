@@ -9,6 +9,7 @@ store and the pinned signed vectors from testdata/sync/push_pull.ndjson.
 """
 
 import json
+import os
 from pathlib import Path
 import re
 import select
@@ -618,6 +619,52 @@ def test_allow_author(directory, changes):
         stop(proc)
 
 
+def test_read_only_store(directory, changes):
+    """Issue #36: a store the daemon cannot write refuses writes with
+    store_io — not stream_malformed — and keeps serving reads."""
+    ro = new_store(directory, "ro-store")
+    proc, port = start(ro, [])
+    try:
+        c = hello(port)
+        r = c.call({"op": "create", "seq": 2, "record": record()})
+        assert r and r.get("ok"), r
+        r = c.call({"op": "append", "seq": 3, "stream": STREAM,
+                    "expected_head": None, "changes": changes[:1]})
+        assert r and r.get("ok") and r.get("head"), r
+        head = r["head"]
+        c.close()
+    finally:
+        stop(proc)
+
+    def tree_mode(mode_dirs, mode_files):
+        for root, dirs, files in os.walk(ro):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), mode_dirs)
+            for f in files:
+                os.chmod(os.path.join(root, f), mode_files)
+
+    tree_mode(0o555, 0o444)
+    try:
+        proc, port = start(ro, [])
+        try:
+            c = hello(port)
+            r = c.call({"op": "create", "seq": 1, "record": record(
+                stream_id="0199de2d-dc00-7000-8000-000000000020", name="ro2")})
+            check("read-only store: create refuses store_io", refused(r, "store_io"), r)
+            r = c.call({"op": "append", "seq": 2, "stream": STREAM,
+                        "expected_head": head, "changes": changes[1:]})
+            check("read-only store: append refuses store_io", refused(r, "store_io"), r)
+            r = c.call({"op": "read", "seq": 3, "stream": STREAM})
+            check("read-only store: read still serves",
+                  r is not None and r.get("ok") and r.get("head") == head, r)
+            c.close()
+            check("read-only store: server keeps serving", alive(port))
+        finally:
+            stop(proc)
+    finally:
+        tree_mode(0o755, 0o644)
+
+
 def test_cli(directory):
     def run(*args):
         return subprocess.run([str(BINARY), *args], capture_output=True, text=True, timeout=10)
@@ -677,6 +724,7 @@ def main():
         run_test(test_persistence_and_recovery, store, changes, head)
         run_test(test_auth, directory, changes)
         run_test(test_allow_author, directory, changes)
+        run_test(test_read_only_store, directory, changes)
         run_test(test_cli, directory)
     failed = [r for r in RESULTS if not r[1]]
     print("\n%d checks, %d failed" % (len(RESULTS), len(failed)))
