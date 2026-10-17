@@ -153,7 +153,7 @@ C1_ID="$(sed -n 's/.*id=\([0-9a-f-]*\).*/\1/p' <<<"$out")"
 
 out="$(flint_in "$C" push --ws=wc)" && fail "C push expected stale_head, got: $out"
 echo "C push:    $out"
-[[ "$out" == "flint: refuse stale_head" ]] || fail "C push refusal: $out"
+[[ "$out" == "flint: refuse stale_head remote head advanced"* ]] || fail "C push refusal: $out"
 
 out="$(flint_in "$C" pull --ws=wc)" && fail "C pull expected fork_needed, got: $out"
 echo "C pull:    $out"
